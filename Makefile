@@ -123,7 +123,6 @@ ifeq ($(RUNTIME_EFFECTIVE),container)
 	  --name $(CONTAINER_NAME) \
 	  --publish $(PORT):$(PORT) \
 	  --env API_TOKEN=$(API_TOKEN) \
-	  --restart on-failure \
 	  $(IMAGE)
 	@printf '\033[1;32m✓ Container démarré : http://localhost:%s\033[0m\n' "$(PORT)"
 else
