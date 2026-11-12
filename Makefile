@@ -2,27 +2,30 @@
 # Makefile — squilladns
 #
 # Autodetection du runtime container :
-#   - Apple Container  (macOS 26+, CLI `container`)
-#   - Docker Desktop / Docker Engine
+#   - Apple Container  (macOS 26+, CLI `container` — pas de plugin compose)
+#   - Docker Desktop / Docker Engine  (avec docker compose v2)
 #   - Colima           (via le socket Docker standard)
 #
-# Surcharge possible depuis la ligne de commande :
+# Surcharge possible :
 #   make up RUNTIME=docker
 #   make up RUNTIME=container
 # =============================================================================
 
 RUNTIME  ?= auto
 IMAGE    := squilladns
-COMPOSE  := docker-compose.yml
+CONTAINER_NAME := squilladns
+PORT     := 8085
+
+# Token par défaut (surchargeable : make up API_TOKEN=montoken)
+API_TOKEN ?= change-me-apres-creation
 
 # ---------------------------------------------------------------------------
-# Détection des CLIs au parse-time (command -v — rapide, sans ping daemon)
+# Détection des CLIs au parse-time
 # ---------------------------------------------------------------------------
 
 DOCKER_CLI    := $(shell command -v docker    >/dev/null 2>&1 && echo yes || echo no)
 CONTAINER_CLI := $(shell command -v container >/dev/null 2>&1 && echo yes || echo no)
 
-# Compose runner : plugin v2 "docker compose" ou binaire standalone "docker-compose"
 DOCKER_COMPOSE := $(shell \
   if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then \
     echo 'docker compose'; \
@@ -31,7 +34,7 @@ DOCKER_COMPOSE := $(shell \
   fi)
 
 # ---------------------------------------------------------------------------
-# Résolution effective du runtime
+# Résolution du runtime effectif
 # ---------------------------------------------------------------------------
 
 ifeq ($(RUNTIME),container)
@@ -39,29 +42,15 @@ ifeq ($(RUNTIME),container)
 else ifeq ($(RUNTIME),docker)
   RUNTIME_EFFECTIVE := docker
 else ifeq ($(CONTAINER_CLI),yes)
-  # Apple Container CLI trouvé → priorité
   RUNTIME_EFFECTIVE := container
 else ifeq ($(DOCKER_CLI),yes)
-  # Docker CLI trouvé (Docker Desktop ou Colima)
   RUNTIME_EFFECTIVE := docker
 else
   RUNTIME_EFFECTIVE := none
 endif
 
 # ---------------------------------------------------------------------------
-# Commandes selon le runtime effectif
-# ---------------------------------------------------------------------------
-
-ifeq ($(RUNTIME_EFFECTIVE),container)
-  DOCKER_BIN     := container
-  COMPOSE_BIN    := container compose
-else
-  DOCKER_BIN     := docker
-  COMPOSE_BIN    := $(DOCKER_COMPOSE)
-endif
-
-# ---------------------------------------------------------------------------
-# Garde : vérifie qu'un runtime est disponible avant chaque cible
+# Garde
 # ---------------------------------------------------------------------------
 
 .PHONY: _guard
@@ -82,11 +71,11 @@ _guard:
 # ---------------------------------------------------------------------------
 
 define print_runtime
-	@printf '\033[1;36m[runtime]\033[0m %s\n' "$(RUNTIME_EFFECTIVE)  (compose: $(COMPOSE_BIN))"
+	@printf '\033[1;36m[runtime]\033[0m %s\n' "$(RUNTIME_EFFECTIVE)"
 endef
 
 # ---------------------------------------------------------------------------
-# Cibles
+# Cibles communes (interface identique quel que soit le runtime)
 # ---------------------------------------------------------------------------
 
 .DEFAULT_GOAL := help
@@ -98,14 +87,14 @@ help: ## Affiche cette aide
 	@grep -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) \
 	  | awk 'BEGIN {FS = ":.*## "}; {printf "  \033[1;33m%-10s\033[0m %s\n", $$1, $$2}'
 	@printf '\n'
-	@printf '  Surcharge du runtime : make <cible> RUNTIME=docker|container\n\n'
+	@printf '  Surcharge : make <cible> RUNTIME=docker|container  API_TOKEN=xxx\n\n'
 
 runtime: ## Affiche le runtime détecté
 	@printf 'RUNTIME override   : %s\n' "$(RUNTIME)"
 	@printf 'RUNTIME_EFFECTIVE  : %s\n' "$(RUNTIME_EFFECTIVE)"
 	@printf 'CONTAINER_CLI      : %s\n' "$(CONTAINER_CLI)"
 	@printf 'DOCKER_CLI         : %s\n' "$(DOCKER_CLI)"
-	@printf 'COMPOSE_BIN        : %s\n' "$(COMPOSE_BIN)"
+	@printf 'DOCKER_COMPOSE     : %s\n' "$(DOCKER_COMPOSE)"
 	@if [ "$(RUNTIME_EFFECTIVE)" = "container" ]; then \
 		container --version 2>/dev/null || true; \
 	elif [ "$(RUNTIME_EFFECTIVE)" = "docker" ]; then \
@@ -113,36 +102,89 @@ runtime: ## Affiche le runtime détecté
 		printf 'Docker context     : %s\n' "$$(docker context show 2>/dev/null)"; \
 	fi
 
+# ── build ──────────────────────────────────────────────────────────────────
+
 build: _guard ## Construit l'image (sans démarrer)
 	$(call print_runtime)
-	$(COMPOSE_BIN) -f $(COMPOSE) build
+ifeq ($(RUNTIME_EFFECTIVE),container)
+	container build -t $(IMAGE) .
+else
+	$(DOCKER_COMPOSE) -f docker-compose.yml build
+endif
 
-up: _guard ## Lance les services en arrière-plan (--build auto)
+# ── up ─────────────────────────────────────────────────────────────────────
+
+up: _guard ## Lance le service en arrière-plan (build auto)
 	$(call print_runtime)
-	$(COMPOSE_BIN) -f $(COMPOSE) up -d --build
+ifeq ($(RUNTIME_EFFECTIVE),container)
+	container build -t $(IMAGE) .
+	container run \
+	  --detach \
+	  --name $(CONTAINER_NAME) \
+	  --publish $(PORT):$(PORT) \
+	  --env API_TOKEN=$(API_TOKEN) \
+	  --restart on-failure \
+	  $(IMAGE)
+	@printf '\033[1;32m✓ Container démarré : http://localhost:%s\033[0m\n' "$(PORT)"
+else
+	$(DOCKER_COMPOSE) -f docker-compose.yml up -d --build
+endif
 
-down: _guard ## Arrête et supprime les containers
+# ── down ───────────────────────────────────────────────────────────────────
+
+down: _guard ## Arrête et supprime le container
 	$(call print_runtime)
-	$(COMPOSE_BIN) -f $(COMPOSE) down
+ifeq ($(RUNTIME_EFFECTIVE),container)
+	container stop $(CONTAINER_NAME)  2>/dev/null || true
+	container delete $(CONTAINER_NAME) 2>/dev/null || true
+else
+	$(DOCKER_COMPOSE) -f docker-compose.yml down
+endif
 
-restart: down up ## Redémarre les services
+# ── restart ────────────────────────────────────────────────────────────────
+
+restart: down up ## Redémarre le service
+
+# ── logs ───────────────────────────────────────────────────────────────────
 
 logs: _guard ## Suit les logs en temps réel (Ctrl+C pour quitter)
 	$(call print_runtime)
-	$(COMPOSE_BIN) -f $(COMPOSE) logs -f
+ifeq ($(RUNTIME_EFFECTIVE),container)
+	container logs --follow $(CONTAINER_NAME)
+else
+	$(DOCKER_COMPOSE) -f docker-compose.yml logs -f
+endif
+
+# ── ps ─────────────────────────────────────────────────────────────────────
 
 ps: _guard ## Liste les containers du projet
 	$(call print_runtime)
-	$(COMPOSE_BIN) -f $(COMPOSE) ps
+ifeq ($(RUNTIME_EFFECTIVE),container)
+	container list | grep -E "NAME|$(CONTAINER_NAME)" || container list
+else
+	$(DOCKER_COMPOSE) -f docker-compose.yml ps
+endif
 
-clean: _guard ## Arrête les containers et supprime l'image locale
-	$(call print_runtime)
-	$(COMPOSE_BIN) -f $(COMPOSE) down
-	$(DOCKER_BIN) rmi -f $(IMAGE) 2>/dev/null || true
+# ── clean ──────────────────────────────────────────────────────────────────
 
-fclean: _guard ## Nettoyage complet : containers, volumes, image, cache build
+clean: down ## Arrête le container et supprime l'image locale
 	$(call print_runtime)
-	$(COMPOSE_BIN) -f $(COMPOSE) down -v --remove-orphans 2>/dev/null || true
-	$(DOCKER_BIN) rmi -f $(IMAGE) 2>/dev/null || true
-	$(DOCKER_BIN) builder prune -f 2>/dev/null || true
+ifeq ($(RUNTIME_EFFECTIVE),container)
+	container image delete $(IMAGE) 2>/dev/null || true
+else
+	docker rmi -f $(IMAGE) 2>/dev/null || true
+endif
+
+# ── fclean ─────────────────────────────────────────────────────────────────
+
+fclean: down ## Nettoyage complet : container, image, volumes, cache build
+	$(call print_runtime)
+ifeq ($(RUNTIME_EFFECTIVE),container)
+	container image delete $(IMAGE) 2>/dev/null || true
+	container prune 2>/dev/null || true
+else
+	$(DOCKER_COMPOSE) -f docker-compose.yml down -v --remove-orphans 2>/dev/null || true
+	docker rmi -f $(IMAGE) 2>/dev/null || true
+	docker builder prune -f 2>/dev/null || true
+endif
 	@printf '\033[1;32m✓ Nettoyage complet terminé\033[0m\n'
