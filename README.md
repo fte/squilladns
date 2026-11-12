@@ -1,5 +1,9 @@
 # squilladns
 
+<p align="center">
+  <img src="squilladns.jpeg" alt="squilladns mascot" width="480">
+</p>
+
 API REST légère en Rust pour gérer les zones d'un DNS primaire BIND9.
 
 Nommé d'après la *squille* (*Squilla mantis*), crustacé à la frappe ultrarapide (~23 ms) et à la vision multispectrale — comme un nameserver qui voit tous les types d'enregistrements et répond sans latence.
