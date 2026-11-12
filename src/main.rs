@@ -1,173 +1,194 @@
 mod zone;
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::convert::Infallible;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http::response::Builder as ResponseBuilder;
-use http_body_util::Full;
-use hyper::body::Bytes as HyperBytes;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Request, Response, Server, StatusCode};
+use hyper::{Request, Response, StatusCode};
 use serde::Deserialize;
 use tokio::net::TcpListener;
 
-use zone::zone_file;
+type HyperBytes = Full<Bytes>;
 
 const VERSION: &str = "0.1.0";
 const ZONES_DIR: &str = "zones/575.be";
 
-async fn bad_request(body: Bytes, resp: ResponseBuilder) -> Response<HyperBytes> {
-    let mut r = resp.status(StatusCode::BAD_REQUEST);
-    r.header("Content-Type", "application/json");
-    r.body(Full::new(body)).unwrap()
+// ---------------------------------------------------------------------------
+// Helpers de réponse
+// ---------------------------------------------------------------------------
+
+fn json_response(status: StatusCode, body: impl Into<Bytes>) -> Response<HyperBytes> {
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(Full::new(body.into()))
+        .unwrap()
 }
 
-async fn unauthorized(body: Bytes, resp: ResponseBuilder) -> Response<HyperBytes> {
-    let mut r = resp.status(StatusCode::UNAUTHORIZED);
-    r.header("Content-Type", "application/json");
-    r.body(Full::new(body)).unwrap()
+fn _bad_request(body: impl Into<Bytes>) -> Response<HyperBytes> {
+    json_response(StatusCode::BAD_REQUEST, body)
 }
 
-async fn not_found(body: Bytes, resp: ResponseBuilder) -> Response<HyperBytes> {
-    let mut r = resp.status(StatusCode::NOT_FOUND);
-    r.header("Content-Type", "application/json");
-    r.body(Full::new(body)).unwrap()
+fn unauthorized(body: impl Into<Bytes>) -> Response<HyperBytes> {
+    json_response(StatusCode::UNAUTHORIZED, body)
 }
 
-async fn internal_error(body: Bytes, resp: ResponseBuilder) -> Response<HyperBytes> {
-    let mut r = resp.status(StatusCode::INTERNAL_SERVER_ERROR);
-    r.header("Content-Type", "application/json");
-    r.body(Full::new(body)).unwrap()
+fn not_found(body: impl Into<Bytes>) -> Response<HyperBytes> {
+    json_response(StatusCode::NOT_FOUND, body)
 }
 
-async fn health_response(resp: ResponseBuilder) -> Response<HyperBytes> {
-    let payload = serde_json::json!({
-        "status": "ok",
-        "version": VERSION,
-        "zones_dir": ZONES_DIR,
+fn internal_error(body: impl Into<Bytes>) -> Response<HyperBytes> {
+    json_response(StatusCode::INTERNAL_SERVER_ERROR, body)
+}
+
+// ---------------------------------------------------------------------------
+// Génération d'un token hex aléatoire
+// ---------------------------------------------------------------------------
+
+fn generate_token() -> String {
+    use std::fmt::Write;
+    let bytes: [u8; 32] = std::array::from_fn(|_| rand::random::<u8>());
+    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
+        write!(s, "{:02x}", b).ok();
+        s
     })
-    .to_string();
-    let mut r = resp.status(StatusCode::OK);
-    r.header("Content-Type", "application/json");
-    r.body(Full::new(payload.into())).unwrap()
 }
 
-async fn list_zones_response(resp: ResponseBuilder) -> Response<HyperBytes> {
-    let payload = serde_json::json!({
-        "zones": vec![],
-    })
-    .to_string();
-    let mut r = resp.status(StatusCode::OK);
-    r.header("Content-Type", "application/json");
-    r.body(Full::new(payload.into())).unwrap()
-}
-
-async fn token_create(token_dir: &str, _payload: &str, token_name: &str) -> (Bytes, ResponseBuilder) {
-    let path = Path::new(token_dir).join(token_name);
-    let secret = hex::encode(rand::random::<[u8; 32]>());
-    fs::write(&path, secret).unwrap_or_else(|e| {
+fn write_token(path: &Path, secret: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).unwrap_or_else(|e| {
+            eprintln!("failed to create token dir: {}", e);
+        });
+    }
+    fs::write(path, secret).unwrap_or_else(|e| {
         eprintln!("failed to write token: {}", e);
     });
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap_or_else(|e| {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap_or_else(|e| {
         eprintln!("failed to set permissions: {}", e);
     });
-    let payload = serde_json::json!({
-        "created": true,
-        "name": token_name,
-        "token": secret,
-    })
-    .to_string();
-    (payload.into(), ResponseBuilder::new().status(StatusCode::CREATED))
 }
 
-async fn handle_request(body: Bytes, path: String, resp: ResponseBuilder, state: Arc<AppState>) -> Response<HyperBytes> {
-    // Extraction du token d'authentification si présent
-    let auth = body
-        .headers
+// ---------------------------------------------------------------------------
+// État partagé
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct AppState {
+    token_path: PathBuf,
+}
+
+// ---------------------------------------------------------------------------
+// Handler principal
+// ---------------------------------------------------------------------------
+
+async fn handle_request(
+    req: Request<Incoming>,
+    state: Arc<AppState>,
+) -> Result<Response<HyperBytes>, Infallible> {
+    let method = req.method().to_string();
+    let path = req.uri().path().to_lowercase();
+
+    // Extraction du header Authorization
+    let auth = req
+        .headers()
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
 
-    // Vérification du token pour les endpoints sensibles
-    let token_dir = state.token_dir.clone();
-    let token_name = state.token_name.clone();
+    // Lecture du body
+    let _body_bytes = req
+        .into_body()
+        .collect()
+        .await
+        .map(|b| b.to_bytes())
+        .unwrap_or_default();
 
+    // Vérification du token pour les endpoints protégés
     if matches!(path.as_str(), "/sync" | "/zones" | "/token") {
         if auth.is_empty() {
-            let payload = serde_json::json!({
-                "error": "unauthorized"
-            })
-            .to_string();
-            return unauthorized(payload.into(), resp).await;
+            return Ok(unauthorized(
+                serde_json::json!({ "error": "unauthorized" }).to_string(),
+            ));
         }
 
-        // Vérification du token
-        let token_path = token_dir.join(token_name);
-        if !token_path.exists() {
-            let payload = serde_json::json!({
-                "error": "token not found"
-            })
-            .to_string();
-            return internal_error(payload.into(), resp).await;
+        if !state.token_path.exists() {
+            return Ok(internal_error(
+                serde_json::json!({ "error": "token not found" }).to_string(),
+            ));
         }
 
-        let stored_token = fs::read_to_string(&token_path).unwrap_or_default();
-        if stored_token != auth.trim_start_matches("Bearer ").trim() {
-            let payload = serde_json::json!({
-                "error": "invalid token"
-            })
-            .to_string();
-            return unauthorized(payload.into(), resp).await;
+        let stored = fs::read_to_string(&state.token_path).unwrap_or_default();
+        let bearer = auth.trim_start_matches("Bearer ").trim();
+        if stored.trim() != bearer {
+            return Ok(unauthorized(
+                serde_json::json!({ "error": "invalid token" }).to_string(),
+            ));
         }
     }
 
-    match path.as_str() {
-        "/health" => health_response(resp).await,
-        "/zones" => list_zones_response(resp).await,
-        "/token" => {
-            let payload = serde_json::json!({
-                "created": true,
-                "name": "dev-token",
-                "token": "temp-token-for-development",
+    let resp = match (method.as_str(), path.as_str()) {
+        ("GET", "/health") => json_response(
+            StatusCode::OK,
+            serde_json::json!({
+                "status": "ok",
+                "version": VERSION,
+                "zones_dir": ZONES_DIR,
             })
-            .to_string();
-            resp.status(StatusCode::CREATED).body(Full::new(payload.into())).unwrap()
+            .to_string(),
+        ),
+
+        ("GET", "/zones") => json_response(
+            StatusCode::OK,
+            serde_json::json!({ "zones": serde_json::Value::Array(vec![]) }).to_string(),
+        ),
+
+        ("POST", "/token") => {
+            let secret = generate_token();
+            write_token(&state.token_path, &secret);
+            json_response(
+                StatusCode::CREATED,
+                serde_json::json!({
+                    "created": true,
+                    "token": secret,
+                })
+                .to_string(),
+            )
         }
-        "/sync" => {
-            // Endpoint de sync : relit les zones et force la synchronisation avec le primaire
-            // Implémenté dans un module séparé (zone.rs)
-            let payload = serde_json::json!({
+
+        ("POST", "/sync") => json_response(
+            StatusCode::OK,
+            serde_json::json!({
                 "serial": "0",
                 "status": "synced",
                 "zone": "",
             })
-            .to_string();
-            resp.status(StatusCode::OK).body(Full::new(payload.into())).unwrap()
-        }
-        _ => {
-            let payload = serde_json::json!({
-                "error": "not_found"
-            })
-            .to_string();
-            not_found(payload.into(), resp).await
-        }
-    }
+            .to_string(),
+        ),
+
+        _ => not_found(serde_json::json!({ "error": "not_found" }).to_string()),
+    };
+
+    Ok(resp)
 }
 
-#[derive(Clone)]
-struct AppState {
-    token_dir: PathBuf,
-    token_name: String,
-}
+// ---------------------------------------------------------------------------
+// Structs de désérialisation (utilisées par zone.rs)
+// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
-struct Record {
+pub struct Record {
     #[serde(alias = "type")]
-    r#type: String,
-    name: String,
-    value: String,
+    pub r#type: String,
+    pub name: String,
+    pub value: String,
 }
 
 #[derive(Deserialize)]
@@ -175,85 +196,64 @@ struct ZonePayload {
     records: Vec<Record>,
 }
 
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    let token_dir = std::env::var("API_TOKEN_DIR")
-        .unwrap_or_else(|_| "/home/gbp4dt5/.api-token".to_string());
-    let token_name = std::env::var("API_TOKEN_NAME")
-        .unwrap_or_else(|_| "dev-token".to_string());
-    let token_path = PathBuf::from(token_dir);
-    let token_name = token_name;
+    // Résolution du chemin du token
+    let token_env = std::env::var("API_TOKEN").unwrap_or_default();
+    let token_path = PathBuf::from(
+        std::env::var("API_TOKEN_PATH")
+            .unwrap_or_else(|_| "/app/.api-token".to_string()),
+    );
 
-    // Création du token si nécessaire
-    if !token_path.exists() {
-        let secret = hex::encode(rand::random::<[u8; 32]>());
-        fs::create_dir_all(token_path.parent().unwrap(), 0o700).unwrap_or_else(|e| {
-            eprintln!("failed to create dir: {}", e);
-        });
-        fs::write(&token_path, secret).unwrap_or_else(|e| {
-            eprintln!("failed to write token: {}", e);
-        });
-        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).unwrap_or_else(|e| {
-            eprintln!("failed to set permissions: {}", e);
-        });
+    // Écriture initiale du token depuis la variable d'env, ou génération si absent
+    if !token_env.is_empty() {
+        write_token(&token_path, &token_env);
+    } else if !token_path.exists() {
+        let secret = generate_token();
+        tracing::warn!("no API_TOKEN set — generated token: {}", secret);
+        write_token(&token_path, &secret);
     }
 
-    let state = AppState {
-        token_dir: token_path,
-        token_name: token_name.clone(),
-    };
+    let state = Arc::new(AppState {
+        token_path: token_path.clone(),
+    });
 
-    let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "127.0.0.1:8085".to_string());
-
+    let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8085".to_string());
     let listener = TcpListener::bind(&addr).await.unwrap_or_else(|e| {
-        eprintln!("failed to bind: {}", e);
+        eprintln!("failed to bind to {}: {}", addr, e);
         std::process::exit(1);
     });
 
-    tracing::info!("listening on {}", addr);
+    tracing::info!("squilladns {} listening on {}", VERSION, addr);
 
-    Server::builder(listener)
-        .serve(service_fn(move |req: Request<HyperBytes>| {
-            let state = state.clone();
-            async move {
-                let path = req
-                    .uri()
-                    .path()
-                    .to_string()
-                    .to_lowercase();
-                let method = req.method().clone();
-
-                // Parse du corps pour les requêtes avec body
-                let body = req.into_body().to_bytes().await.unwrap_or_default().to_vec();
-                let body = Bytes::from(body);
-
-                match (method.as_str(), path.as_str()) {
-                    ("GET", "/health") => handle_request(body, path, Response::builder(), state).await,
-                    ("GET", "/zones") => handle_request(body, path, Response::builder(), state).await,
-                    ("POST", "/token") => handle_request(body, path, Response::builder(), state).await,
-                    ("POST", "/sync") => handle_request(body, path, Response::builder(), state).await,
-                    ("PUT", _) | ("DELETE", _) => {
-                        let payload = serde_json::json!({
-                            "error": "not_implemented"
-                        })
-                        .to_string();
-                        return unauthorized(payload.into(), Response::builder()).await;
-                    }
-                    _ => {
-                        let payload = serde_json::json!({
-                            "error": "not_found"
-                        })
-                        .to_string();
-                        not_found(payload.into(), Response::builder()).await
-                    }
-                }
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("accept error: {}", e);
+                continue;
             }
-        }))
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("server error: {}", e);
-            std::process::exit(1);
+        };
+
+        tracing::debug!("connection from {}", peer);
+
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(e) = http1::Builder::new()
+                .serve_connection(
+                    hyper_util::rt::TokioIo::new(stream),
+                    service_fn(move |req| handle_request(req, Arc::clone(&state))),
+                )
+                .await
+            {
+                eprintln!("connection error: {}", e);
+            }
         });
+    }
 }

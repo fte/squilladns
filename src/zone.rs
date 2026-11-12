@@ -11,18 +11,16 @@ pub fn zones_dir() -> PathBuf {
 }
 
 /// Calcule le serial BIND9 pour une zone.
-/// Règle : max(heure UTC, serial + 1)
-///
-/// Serial BIND9 : AAAAMMJJ (jours depuis 1970)
+/// Règle : max(jours UTC depuis epoch, serial + 1)
 pub fn compute_serial(existing_serial: Option<i32>) -> i32 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64 / 86400)
+        .map(|d| (d.as_secs() / 86400) as i32)
         .unwrap_or(0);
 
     let next = existing_serial.map(|s| s + 1).unwrap_or(0);
 
-    now.max(next) as i32
+    now.max(next)
 }
 
 /// Génère le contenu d'un fichier de zone BIND9.
@@ -33,11 +31,9 @@ pub fn generate_zone_file(
     zone_dir: &Path,
 ) -> Result<PathBuf, String> {
     let zone_path = zone_dir.join(zone_name);
-    std::fs::create_dir_all(&zone_path, 0o755)
+    std::fs::create_dir_all(&zone_path)
         .map_err(|e| format!("failed to create zone dir: {}", e))?;
 
-    // Format BIND9 : @ pour l'origin
-    let origin = format!("{}.575.be", zone_name);
     let mut lines: Vec<String> = Vec::new();
 
     // SOA record
@@ -49,76 +45,56 @@ pub fn generate_zone_file(
     // A records
     for r in records {
         if r.r#type == "A" {
-            lines.push(format!(
-                "{}@{} 3600 IN A {}",
-                r.name, r.value
-            ));
+            lines.push(format!("{} 3600 IN A {}", r.name, r.value));
         }
     }
 
     // AAAA records
     for r in records {
         if r.r#type == "AAAA" {
-            lines.push(format!(
-                "{}@{} 3600 IN AAAA {}",
-                r.name, r.value
-            ));
+            lines.push(format!("{} 3600 IN AAAA {}", r.name, r.value));
         }
     }
 
     // CNAME records
     for r in records {
         if r.r#type == "CNAME" {
-            lines.push(format!(
-                "{}@{} 3600 IN CNAME {}",
-                r.name, r.value
-            ));
+            lines.push(format!("{} 3600 IN CNAME {}", r.name, r.value));
         }
     }
 
     // MX records
     for r in records {
         if r.r#type == "MX" {
-            lines.push(format!(
-                "{}@{} 3600 IN MX {} {}",
-                r.name, r.value.split_whitespace().next().unwrap_or("10"),
-                r.value.split_whitespace().nth(1).unwrap_or("")
-            ));
+            let priority = r.value.split_whitespace().next().unwrap_or("10");
+            let target = r.value.split_whitespace().nth(1).unwrap_or("");
+            lines.push(format!("{} 3600 IN MX {} {}", r.name, priority, target));
         }
     }
 
     // NS records
     for r in records {
         if r.r#type == "NS" {
-            lines.push(format!(
-                "{}@{} 3600 IN NS {}",
-                r.name, r.value
-            ));
+            lines.push(format!("{} 3600 IN NS {}", r.name, r.value));
         }
     }
 
     // TXT records
     for r in records {
         if r.r#type == "TXT" {
-            lines.push(format!(
-                "{}@{} 3600 IN TXT {}",
-                r.name, r.value
-            ));
+            lines.push(format!("{} 3600 IN TXT {}", r.name, r.value));
         }
     }
 
-    // SRV records
+    // SRV records : value = "priority weight port target"
     for r in records {
         if r.r#type == "SRV" {
-            // SRV : priority weight port target
-            if let Some(parts) = r.value.split_whitespace().collect::<Vec<_>>().get(1..) {
-                if parts.len() >= 4 {
-                    lines.push(format!(
-                        "{}@{} 3600 IN SRV {} {} {} {}",
-                        r.name,
-                        parts[0], parts[1], parts[2], parts[3]
-                    ));
-                }
+            let parts: Vec<&str> = r.value.split_whitespace().collect();
+            if parts.len() >= 4 {
+                lines.push(format!(
+                    "{} 3600 IN SRV {} {} {} {}",
+                    r.name, parts[0], parts[1], parts[2], parts[3]
+                ));
             }
         }
     }
@@ -126,10 +102,7 @@ pub fn generate_zone_file(
     // CAA records
     for r in records {
         if r.r#type == "CAA" {
-            lines.push(format!(
-                "{}@{} 3600 IN CAA {}",
-                r.name, r.value
-            ));
+            lines.push(format!("{} 3600 IN CAA {}", r.name, r.value));
         }
     }
 
