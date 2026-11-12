@@ -44,28 +44,28 @@ pub fn generate_zone_file(
 
     // A records
     for r in records {
-        if r.r#type == "A" {
+        if r.record_type == "A" {
             lines.push(format!("{} 3600 IN A {}", r.name, r.value));
         }
     }
 
     // AAAA records
     for r in records {
-        if r.r#type == "AAAA" {
+        if r.record_type == "AAAA" {
             lines.push(format!("{} 3600 IN AAAA {}", r.name, r.value));
         }
     }
 
     // CNAME records
     for r in records {
-        if r.r#type == "CNAME" {
+        if r.record_type == "CNAME" {
             lines.push(format!("{} 3600 IN CNAME {}", r.name, r.value));
         }
     }
 
     // MX records
     for r in records {
-        if r.r#type == "MX" {
+        if r.record_type == "MX" {
             let priority = r.value.split_whitespace().next().unwrap_or("10");
             let target = r.value.split_whitespace().nth(1).unwrap_or("");
             lines.push(format!("{} 3600 IN MX {} {}", r.name, priority, target));
@@ -74,21 +74,21 @@ pub fn generate_zone_file(
 
     // NS records
     for r in records {
-        if r.r#type == "NS" {
+        if r.record_type == "NS" {
             lines.push(format!("{} 3600 IN NS {}", r.name, r.value));
         }
     }
 
     // TXT records
     for r in records {
-        if r.r#type == "TXT" {
+        if r.record_type == "TXT" {
             lines.push(format!("{} 3600 IN TXT {}", r.name, r.value));
         }
     }
 
     // SRV records : value = "priority weight port target"
     for r in records {
-        if r.r#type == "SRV" {
+        if r.record_type == "SRV" {
             let parts: Vec<&str> = r.value.split_whitespace().collect();
             if parts.len() >= 4 {
                 lines.push(format!(
@@ -101,7 +101,7 @@ pub fn generate_zone_file(
 
     // CAA records
     for r in records {
-        if r.r#type == "CAA" {
+        if r.record_type == "CAA" {
             lines.push(format!("{} 3600 IN CAA {}", r.name, r.value));
         }
     }
