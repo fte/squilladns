@@ -1,0 +1,5 @@
+/target
+.api-token
+*.log
+.DS_Store
+.env

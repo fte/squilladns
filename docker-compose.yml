@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  dns-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: squilladns
+    ports:
+      - "8085:8085"
+    environment:
+      - API_TOKEN=${API_TOKEN:-change-me-apres-creation}
+    volumes:
+      # Persister les zones localement si besoin
+      - ./zones:/app/zones:ro
+    restart: unless-stopped
+    networks:
+      - dns-net
+
+networks:
+  dns-net:
+    driver: bridge
