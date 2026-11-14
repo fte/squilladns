@@ -4,84 +4,176 @@
   <img src="squilladns.jpeg" alt="squilladns mascot" width="480">
 </p>
 
-API REST légère en Rust pour gérer les zones d'un DNS primaire BIND9.
+SquillaDNS est une API REST légère écrite en Rust pour gérer des zones DNS BIND9 depuis un service HTTP. Le projet a pour objectif de fournir un point d'entrée simple pour provisionner, synchroniser et exposer des enregistrements DNS sans devoir manipuler directement des fichiers de zone sur un serveur distant.
 
-Nommé d'après la *squille* (*Squilla mantis*), crustacé à la frappe ultrarapide (~23 ms) et à la vision multispectrale — comme un nameserver qui voit tous les types d'enregistrements et répond sans latence.
+Le nom vient de la squille, un crustacé rapide et très observateur, ce qui rappelle un nameserver capable de lire toutes les formes d'enregistrements et de répondre vite.
 
-## Fonctionnalités
+## Statut du projet
 
-- Installer, modifier, supprimer des zones BIND9
-- Types d'enregistrements : A, AAAA, CNAME, MX, NS, SOA, TXT, SRV, CAA
-- Serial calculé en mémoire : `max(date UTC, serial + 1)`
-- Authentification par Bearer token (fichier `.api-token`, mode 600)
-- Déployable en Docker / Docker Compose
+- Version actuelle : `0.1.0`
+- Type : prototype / base technique de production orientée service
+- Focus actuel : API REST protégée par token, validation DNS, génération de fichiers de zone et conteneurisation Docker
 
-## Stack
+## Fonctionnalités principales
 
-- **HTTP** : `hyper` 1.12 + `tokio`
-- **DNS** : `hickory-dns` 0.25 (`hickory-server`, `hickory-client`, `hickory-proto`)
-- **Sérialisation** : `serde` / `serde_json`
-- **Logs** : `tracing` / `tracing-subscriber`
+### Gestion de zones DNS
 
-## Endpoints
+- Synchroniser les enregistrements reçus par l'API vers un fichier de zone sur disque
+- Générer un SOA automatiquement et ajouter un NS d'apex par défaut si aucun n'est fourni
+- Valider les enregistrements et le fichier final avec `named-checkzone`
+- Générer des fichiers `*.zone` destinés à être consommés par BIND9
+- Préparer un layout de travail par domaine (`zones/example.invalid/...`)
+- La liste de zones est exposée par `/zones`, mais son implémentation est encore à compléter
+
+### Types d'enregistrements supportés
+
+Les enregistrements fournis par le client peuvent être :
+
+- `A`
+- `AAAA`
+- `CNAME`
+- `MX`
+- `NS`
+- `TXT`
+- `SRV`
+- `CAA`
+
+Le SOA est généré automatiquement ; il ne fait pas partie des types acceptés dans le payload.
+
+### Calcul de serial BIND9
+
+- Le helper de serial applique `max(jour UTC depuis epoch, serial existant + 1)`
+- La route `/sync` ne relit pas encore le serial du fichier existant et appelle actuellement ce helper sans serial précédent
+
+### Authentification et sécurité
+
+- Authentification Bearer par token partagé configuré avec `API_TOKEN` ou généré au démarrage
+- Conservation du token dans `API_TOKEN_PATH`, avec permissions Unix `0600`
+- Protection des routes `/zones`, `/sync` et `/token`
+- Documentation OpenAPI / Swagger incluse
+
+### Déploiement et exploitation
+
+- Service HTTP via `axum` + `tokio`
+- Exécution en conteneur Docker
+- Support Docker Compose pour un déploiement rapide
+- Logs structurés via `tracing`
+- API documentée via Swagger UI sur `/docs`
+
+## Stack technique
+
+- HTTP : `axum`, `tokio`, `tower`
+- DNS / zone generation : `hickory-*`
+- Serialization : `serde`, `serde_json`
+- Logging : `tracing`, `tracing-subscriber`
+- OpenAPI : `utoipa`, `utoipa-swagger-ui`
+- Conteneurisation : Docker, Docker Compose
+
+## Points d'entrée API
 
 | Méthode | Chemin | Description | Auth |
 |---------|--------|-------------|------|
-| GET | `/health` | État de santé | — |
-| GET | `/zones` | Lister les zones | — |
-| POST | `/token` | Créer un token | — |
-| POST | `/sync` | Sync une zone (`?zone=<name>`) | Bearer |
-| PUT | `/zones/<name>` | Installer/modifier une zone | Bearer |
-| DELETE | `/zones/<name>` | Supprimer une zone | Bearer |
+| GET | `/health` | Vérifie l'état du service | — |
+| GET | `/zones` | Liste des zones (implémentation à compléter) | Requise |
+| POST | `/sync` | Valide et écrit le fichier de zone `default` | Requise |
+| POST | `/token` | Génère un nouveau token interne | Requise |
+| GET | `/docs` | Interface Swagger UI | — |
+
+La route `/sync` accepte un payload JSON de type :
+
+```json
+{
+  "records": [
+    {"type": "A", "name": "@", "value": "1.2.3.4"},
+    {"type": "TXT", "name": "@", "value": "v=spf1 include:_spf.example ~all"}
+  ]
+}
+```
 
 ## Démarrage rapide
 
-```bash
-# Build et lancement
-docker compose up -d
+### Avec Docker Compose
 
-# Vérifier
+```bash
+export API_TOKEN="$(openssl rand -hex 32)"
+docker compose up --build -d
 curl http://127.0.0.1:8085/health
+```
+
+Définis un token aléatoire avant de démarrer ; ne conserve pas le token d'exemple fourni par les configurations de développement.
+
+### Avec Makefile
+
+```bash
+make up
+make logs
 ```
 
 ## Variables d'environnement
 
 | Variable | Défaut | Description |
 |----------|--------|-------------|
-| `API_TOKEN` | — | Bearer token requis pour les endpoints d'écriture |
-| `API_ADDR` | `127.0.0.1:8085` | Adresse d'écoute |
-| `ZONES_DIR` | `zones/575.be` | Dossier racine des zones |
+| `API_ADDR` | `0.0.0.0:8085` | Adresse d'écoute du service |
+| `API_TOKEN` | vide | Token interne préconfiguré si fourni |
+| `API_TOKEN_PATH` | `/app/.api-token` | Emplacement du fichier de token |
+| `ZONES_DIR` | `zones/example.invalid` | Répertoire racine des zones |
 
-## Exemple : installer une zone
+## Exemple de consommation
+
+### Vérifier l'état du service
 
 ```bash
-curl -X PUT http://127.0.0.1:8085/zones/www \
-  -H "Authorization: Bearer $API_TOKEN" \
+curl http://127.0.0.1:8085/health
+```
+
+### Synchroniser une zone
+
+```bash
+curl -X POST http://127.0.0.1:8085/sync \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <token>" \
   -d '{
     "records": [
-      {"type": "A",   "name": "@", "value": "217.128.154.10"},
-      {"type": "MX",  "name": "@", "value": "10 mail.575.be."},
+      {"type": "A", "name": "@", "value": "217.128.154.10"},
+      {"type": "MX", "name": "@", "value": "10 mail.example.invalid."},
       {"type": "TXT", "name": "@", "value": "v=spf1 include:_spf.google.com ~all"}
     ]
   }'
 ```
 
-## Intégration dans un dépôt de config
+### Générer un token interne
 
-Le dépôt de configuration (ex. `vps/zones/575.be/a/`) référence l'image publiée :
-
-```yaml
-# docker-compose.yml
-services:
-  squilladns:
-    image: ghcr.io/fte/squilladns:latest
-    ports:
-      - "8085:8085"
-    environment:
-      - API_TOKEN=${API_TOKEN}
-    restart: unless-stopped
+```bash
+curl -X POST http://127.0.0.1:8085/token \
+  -H "Authorization: Bearer <token>"
 ```
+
+## Structure du dépôt
+
+```text
+.
+├── src/
+│   ├── main.rs
+│   ├── validation.rs
+│   └── zone.rs
+├── zones/
+│   └── example.invalid/
+├── Dockerfile
+├── docker-compose.yml
+├── Makefile
+├── Cargo.toml
+├── README.md
+├── ROADMAP.md
+└── squilladns.jpeg
+```
+
+## Installation et déploiement
+
+Pour la procédure d'installation, le déploiement en Docker et les recommandations de production, voir [INSTALL.md](./INSTALL.md).
+
+## Roadmap
+
+La roadmap détaillée est disponible dans [ROADMAP.md](./ROADMAP.md).
 
 ## Licence
 

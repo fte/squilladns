@@ -1507,6 +1507,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "thiserror 2.0.21",
  "tokio",
  "tower",
  "tower-http 0.5.2",

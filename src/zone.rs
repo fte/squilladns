@@ -2,11 +2,10 @@ use std::path::{Path, PathBuf};
 
 use crate::Record;
 
-/// Chemin racine des zones pour 575.be
+/// Chemin racine des zones pour example.invalid
 pub fn zones_dir() -> PathBuf {
     PathBuf::from(
-        std::env::var("ZONES_DIR")
-            .unwrap_or_else(|_| "zones/575.be".to_string()),
+        std::env::var("ZONES_DIR").unwrap_or_else(|_| "zones/example.invalid".to_string()),
     )
 }
 
@@ -31,16 +30,22 @@ pub fn generate_zone_file(
     zone_dir: &Path,
 ) -> Result<PathBuf, String> {
     let zone_path = zone_dir.join(zone_name);
-    std::fs::create_dir_all(&zone_path)
-        .map_err(|e| format!("failed to create zone dir: {}", e))?;
+    std::fs::create_dir_all(&zone_path).map_err(|e| format!("failed to create zone dir: {}", e))?;
 
     let mut lines: Vec<String> = Vec::new();
 
     // SOA record
     lines.push(format!(
-        "@\t3600\tIN\tSOA\tns.575.be. hostmaster.575.be. {} 3600 900 604800 86400",
+        "@\t3600\tIN\tSOA\tns.example.invalid. hostmaster.example.invalid. {} 3600 900 604800 86400",
         serial
     ));
+
+    if !records
+        .iter()
+        .any(|record| record.record_type.eq_ignore_ascii_case("NS") && record.name == "@")
+    {
+        lines.push("@ 3600 IN NS ns.example.invalid.".into());
+    }
 
     // A records
     for r in records {

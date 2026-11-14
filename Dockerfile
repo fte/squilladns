@@ -22,7 +22,7 @@ RUN touch src/main.rs && cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y ca-certificates tzdata \
+    && apt-get install -y bind9-utils ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /app/target/release/squilladns .

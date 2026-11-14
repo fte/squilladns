@@ -1,4 +1,5 @@
 mod auth;
+mod validation;
 mod zone;
 
 use std::fs;
@@ -8,19 +9,20 @@ use std::sync::Arc;
 
 use axum::{
     extract::State,
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    response::{IntoResponse, Redirect},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use tower_http::cors::{Any, CorsLayer};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
-use auth::resolve_user;
+use validation::{validate_zone_payload, ProblemDetails, ValidationErrorCode};
 
 const VERSION: &str = "0.1.0";
-const ZONES_DIR: &str = "zones/575.be";
+const ZONES_DIR: &str = "zones/example.invalid";
 
 // ---------------------------------------------------------------------------
 // OpenAPI spec
@@ -39,13 +41,7 @@ const ZONES_DIR: &str = "zones/575.be";
             Providers supportés : Google, GitHub, Microsoft.\n\
             Mode sandbox : `SANDBOX_USER=alice` (dev local, pas de provider requis)."
     ),
-    paths(
-        handle_health,
-        handle_me,
-        handle_list_zones,
-        handle_sync,
-        handle_token,
-    ),
+    paths(handle_health, handle_list_zones, handle_token, handle_sync,),
     components(schemas(
         HealthResponse,
         MeResponse,
@@ -53,6 +49,8 @@ const ZONES_DIR: &str = "zones/575.be";
         TokenResponse,
         SyncResponse,
         ErrorResponse,
+        ProblemDetails,
+        ValidationErrorCode,
         Record,
         ZonePayload,
     ))
@@ -133,14 +131,41 @@ type SharedState = Arc<AppState>;
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn auth_mode() -> String {
-    if let Ok(u) = std::env::var("SANDBOX_USER") {
-        if !u.is_empty() {
-            return format!("sandbox({})", u);
-        }
+fn check_auth(
+    headers: &HeaderMap,
+    token_path: &Path,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let auth = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+
+    if auth.is_empty() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "missing authorization header".into(),
+            }),
+        ));
     }
-    if std::env::var("AUTH_PROVIDER").is_ok() {
-        return format!("provider({})", std::env::var("AUTH_PROVIDER").unwrap());
+
+    let stored = fs::read_to_string(token_path).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "token not configured".into(),
+            }),
+        )
+    })?;
+    let bearer = auth.strip_prefix("Bearer ").unwrap_or(auth).trim();
+
+    if stored.trim() != bearer {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "invalid token".into(),
+            }),
+        ));
     }
     "public".into()
 }
@@ -149,11 +174,37 @@ fn err(status: StatusCode, msg: &str) -> axum::response::Response {
     (status, Json(ErrorResponse { error: msg.into() })).into_response()
 }
 
+fn problem(
+    status: StatusCode,
+    title: &str,
+    detail: &str,
+    instance: &str,
+) -> axum::response::Response {
+    let body = ProblemDetails::new(status.as_u16(), title)
+        .with_detail(detail)
+        .with_instance(instance);
+    (status, Json(body)).into_response()
+}
+
+fn validation_problem(
+    errors: &[validation::ValidationError],
+    instance: &str,
+) -> axum::response::Response {
+    let body = validation::validation_errors_to_problem_details(errors, Some(instance));
+    let status = StatusCode::from_u16(body.status).unwrap_or(StatusCode::BAD_REQUEST);
+    (status, Json(body)).into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// État du service et mode d'authentification actif
+/// Redirige la racine vers la documentation Swagger
+async fn handle_root() -> Redirect {
+    Redirect::permanent("/docs/")
+}
+
+/// Vérifie l'état du service
 #[utoipa::path(
     get,
     path = "/health",
@@ -183,101 +234,126 @@ async fn handle_health() -> impl IntoResponse {
     ),
     security(("bearer_token" = []))
 )]
-async fn handle_me(headers: HeaderMap) -> impl IntoResponse {
-    match resolve_user(&headers).await {
-        Some(user) => Json(MeResponse {
-            authenticated: true,
-            id: Some(user.id),
-            email: user.email,
-            provider: Some(user.provider),
-        }),
-        None => Json(MeResponse {
-            authenticated: false,
-            id: None,
-            email: None,
-            provider: None,
-        }),
+async fn handle_list_zones(
+    headers: HeaderMap,
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    if let Err(error) = check_auth(&headers, &state.token_path) {
+        return error.into_response();
     }
 }
 
-/// Liste les zones DNS
-///
-/// - **Anonyme** : retourne toutes les zones publiques
-/// - **Authentifié** : retourne uniquement les zones de cet utilisateur
-#[utoipa::path(
-    get,
-    path = "/zones",
-    responses(
-        (status = 200, description = "Liste des zones", body = ZonesResponse),
-    ),
-    security(("bearer_token" = []))
-)]
-async fn handle_list_zones(
-    headers: HeaderMap,
-    State(_state): State<SharedState>,
-) -> impl IntoResponse {
-    let user = resolve_user(&headers).await;
-
-    let (zones, scope) = match &user {
-        Some(u) => {
-            // TODO: filtrer les zones depuis le stockage par u.id
-            tracing::info!("list zones for user {}", u.id);
-            (vec![], format!("private:{}", u.id))
-        }
-        None => {
-            // TODO: retourner toutes les zones publiques
-            tracing::info!("list zones — public");
-            (vec![], "public".into())
-        }
-    };
-
-    Json(ZonesResponse { zones, scope }).into_response()
-}
-
-/// Synchronise / écrit une zone DNS
-///
-/// - **Anonyme** : écrit dans le namespace public (partagé)
-/// - **Authentifié** : écrit dans le namespace de l'utilisateur
+/// Valide et écrit le fichier de zone DNS
 #[utoipa::path(
     post,
     path = "/sync",
     request_body = ZonePayload,
     responses(
         (status = 200, description = "Zone synchronisée", body = SyncResponse),
-        (status = 400, description = "Payload invalide", body = ErrorResponse),
-        (status = 500, description = "Erreur interne", body = ErrorResponse),
+        (status = 400, description = "Payload invalide", body = ProblemDetails),
+        (status = 401, description = "Non autorisé", body = ErrorResponse),
+        (status = 422, description = "Zone invalide", body = ProblemDetails),
+        (status = 500, description = "Erreur interne", body = ProblemDetails),
     ),
     security(("bearer_token" = []))
 )]
 async fn handle_sync(
     headers: HeaderMap,
-    State(_state): State<SharedState>,
+    State(state): State<SharedState>,
     Json(payload): Json<ZonePayload>,
 ) -> impl IntoResponse {
-    let user = resolve_user(&headers).await;
+    if let Err(error) = check_auth(&headers, &state.token_path) {
+        return error.into_response();
+    }
 
-    // Le nom de zone inclut le namespace : "public" ou "user:<id>"
-    let namespace = match &user {
-        Some(u) => format!("user-{}", u.id),
-        None => "public".into(),
-    };
+    if let Err(errors) = validate_zone_payload(&payload) {
+        return validation_problem(&errors, "/sync");
+    }
 
-    let zone_name = format!("{}-default", namespace);
+    let zone_name = "default";
     let serial = zone::compute_serial(None);
-    let zone_dir = zone::zones_dir();
+    let zone_file =
+        match zone::generate_zone_file(zone_name, &payload.records, serial, &zone::zones_dir()) {
+            Ok(path) => path,
+            Err(error) => {
+                return problem(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal Server Error",
+                    &error,
+                    "/sync",
+                );
+            }
+        };
 
-    match zone::generate_zone_file(&zone_name, &payload.records, serial, &zone_dir) {
-        Ok(_) => Json(SyncResponse {
-            status: "synced".into(),
-            zone: zone_name,
-            serial: serial.to_string(),
-            scope: match &user {
-                Some(u) => format!("private:{}", u.id),
-                None => "public".into(),
-            },
-        })
-        .into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    if let Err(error) = validation::validate_zone_file_with_named_checkzone(zone_name, &zone_file) {
+        return validation_problem(&[error], "/sync");
+    }
+
+    Json(SyncResponse {
+        status: "synced".into(),
+        zone: zone_name.into(),
+        serial: serial.to_string(),
+    })
+    .into_response()
+}
+
+/// Génère ou renouvelle le token d'API
+#[utoipa::path(
+    post,
+    path = "/token",
+    responses(
+        (status = 201, description = "Token créé", body = TokenResponse),
+        (status = 401, description = "Authentification requise", body = ErrorResponse),
+    ),
+    security(("bearer_token" = []))
+)]
+async fn handle_token(headers: HeaderMap, State(state): State<SharedState>) -> impl IntoResponse {
+    if let Err(error) = check_auth(&headers, &state.token_path) {
+        return error.into_response();
+    }
+
+    let secret = generate_token();
+    write_token(&state.token_path, &secret);
+
+    (
+        StatusCode::CREATED,
+        Json(TokenResponse {
+            created: true,
+            token: secret,
+        }),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// CORS
+// ---------------------------------------------------------------------------
+
+/// Construit la couche CORS.
+///
+/// `CORS_ALLOWED_ORIGINS` accepte une liste séparée par des virgules
+/// (ex. `http://localhost:8904,null`) ou `*` pour tout autoriser.
+/// Par défaut : tout autoriser, pratique pour les clients `file://` (Origin: null)
+/// et les serveurs statiques locaux sur un port quelconque.
+fn cors_layer() -> CorsLayer {
+    let raw = std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_default();
+    let listed: Vec<HeaderValue> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .filter_map(|origin| HeaderValue::from_str(origin).ok())
+        .collect();
+
+    let layer = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
+        .expose_headers([header::CONTENT_TYPE])
+        .max_age(std::time::Duration::from_secs(3600));
+
+    if raw.contains('*') || listed.is_empty() {
+        layer.allow_origin(Any)
+    } else {
+        layer.allow_origin(listed)
     }
 }
 
@@ -359,22 +435,27 @@ async fn main() {
 
     let app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", ApiDoc::openapi()))
-        .route("/health",    get(handle_health))
-        .route("/auth/me",   get(handle_me))
-        .route("/zones",     get(handle_list_zones))
-        .route("/sync",      post(handle_sync))
-        .route("/token",     post(handle_token))
+        .route("/", get(handle_root))
+        .route("/health", get(handle_health))
+        .route("/zones", get(handle_list_zones))
+        .route("/token", post(handle_token))
+        .route("/sync", post(handle_sync))
+        .layer(cors_layer())
         .with_state(state);
 
     let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8085".to_string());
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| {
-        eprintln!("bind {}: {}", addr, e);
-        std::process::exit(1);
-    });
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("bind {}: {}", addr, e);
+            std::process::exit(1);
+        });
 
     tracing::info!(
-        "squilladns {} on {} — mode: {} — docs: http://{}/docs",
-        VERSION, addr, auth_mode(), addr
+        "squilladns {} on {} — docs: http://{}/docs",
+        VERSION,
+        addr,
+        addr
     );
 
     axum::serve(listener, app).await.unwrap_or_else(|e| {
