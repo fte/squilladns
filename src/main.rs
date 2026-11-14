@@ -1,3 +1,4 @@
+mod auth;
 mod validation;
 mod zone;
 
@@ -32,11 +33,18 @@ const ZONES_DIR: &str = "zones/example.invalid";
     info(
         title = "SquillaDNS API",
         version = "0.1.0",
-        description = "DNS zone management API"
+        description = "DNS zone management API.\n\n\
+            ## Authentification (optionnelle)\n\
+            Sans token : accès public, toutes les zones sont visibles et modifiables.\n\
+            Avec `Authorization: Bearer <token>` : les zones de l'utilisateur sont \
+            isolées et invisibles aux autres.\n\n\
+            Providers supportés : Google, GitHub, Microsoft.\n\
+            Mode sandbox : `SANDBOX_USER=alice` (dev local, pas de provider requis)."
     ),
     paths(handle_health, handle_list_zones, handle_token, handle_sync,),
     components(schemas(
         HealthResponse,
+        MeResponse,
         ZonesResponse,
         TokenResponse,
         SyncResponse,
@@ -58,11 +66,22 @@ struct HealthResponse {
     status: String,
     version: String,
     zones_dir: String,
+    auth_mode: String,
+}
+
+#[derive(Serialize, ToSchema)]
+struct MeResponse {
+    authenticated: bool,
+    id: Option<String>,
+    email: Option<String>,
+    provider: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
 struct ZonesResponse {
     zones: Vec<String>,
+    /// "public" ou "private:<user_id>"
+    scope: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -76,6 +95,7 @@ struct SyncResponse {
     status: String,
     zone: String,
     serial: String,
+    scope: String,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -83,7 +103,7 @@ struct ErrorResponse {
     error: String,
 }
 
-#[derive(Deserialize, Serialize, ToSchema)]
+#[derive(Deserialize, Serialize, ToSchema, Clone)]
 pub struct Record {
     #[serde(rename = "type")]
     pub record_type: String,
@@ -108,7 +128,7 @@ struct AppState {
 type SharedState = Arc<AppState>;
 
 // ---------------------------------------------------------------------------
-// Middleware d'authentification (extracteur manuel)
+// Helpers
 // ---------------------------------------------------------------------------
 
 fn check_auth(
@@ -147,8 +167,11 @@ fn check_auth(
             }),
         ));
     }
+    "public".into()
+}
 
-    Ok(())
+fn err(status: StatusCode, msg: &str) -> axum::response::Response {
+    (status, Json(ErrorResponse { error: msg.into() })).into_response()
 }
 
 fn problem(
@@ -194,16 +217,20 @@ async fn handle_health() -> impl IntoResponse {
         status: "ok".into(),
         version: VERSION.into(),
         zones_dir: ZONES_DIR.into(),
+        auth_mode: auth_mode(),
     })
 }
 
-/// Liste les zones DNS disponibles
+/// Retourne l'identité de l'appelant courant
+///
+/// - Anonyme si pas de token
+/// - Identifié si token valide auprès d'un provider (Google, GitHub, Microsoft)
+/// - Toujours identifié en mode sandbox
 #[utoipa::path(
     get,
-    path = "/zones",
+    path = "/auth/me",
     responses(
-        (status = 200, description = "Liste des zones", body = ZonesResponse),
-        (status = 401, description = "Non autorisé", body = ErrorResponse),
+        (status = 200, description = "Identité résolue (peut être anonyme)", body = MeResponse)
     ),
     security(("bearer_token" = []))
 )]
@@ -214,8 +241,6 @@ async fn handle_list_zones(
     if let Err(error) = check_auth(&headers, &state.token_path) {
         return error.into_response();
     }
-
-    Json(ZonesResponse { zones: vec![] }).into_response()
 }
 
 /// Valide et écrit le fichier de zone DNS
@@ -330,6 +355,37 @@ fn cors_layer() -> CorsLayer {
     } else {
         layer.allow_origin(listed)
     }
+}
+
+/// Génère ou renouvelle le token d'API interne
+///
+/// Cet endpoint est protégé — nécessite un utilisateur authentifié.
+#[utoipa::path(
+    post,
+    path = "/token",
+    responses(
+        (status = 201, description = "Token créé", body = TokenResponse),
+        (status = 401, description = "Authentification requise", body = ErrorResponse),
+    ),
+    security(("bearer_token" = []))
+)]
+async fn handle_token(
+    headers: HeaderMap,
+    State(state): State<SharedState>,
+) -> impl IntoResponse {
+    // /token est le seul endpoint qui exige une auth
+    let Some(_user) = resolve_user(&headers).await else {
+        return err(StatusCode::UNAUTHORIZED, "authentication required");
+    };
+
+    let secret = generate_token();
+    write_token(&state.token_path, &secret);
+
+    (
+        StatusCode::CREATED,
+        Json(TokenResponse { created: true, token: secret }),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------

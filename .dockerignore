@@ -1,4 +1,19 @@
-/target
-.api-token
+# Exclure tout sauf le strict nécessaire à la compilation
+# Réduit le contexte de build pour contourner le bug Apple Container
+# builder shim qui écrit dans /tmp de l'hôte
+
+target/
+.git/
+.github/
+.kiro/
+assets/
+zones/
+*.md
+*.jpeg
+*.ico
 *.log
 .DS_Store
+.gitignore
+.dockerignore
+docker-compose.yml
+Makefile
