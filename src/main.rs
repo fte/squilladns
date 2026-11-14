@@ -8,12 +8,13 @@ use std::sync::Arc;
 
 use axum::{
     extract::State,
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    response::{IntoResponse, Redirect},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use tower_http::cors::{Any, CorsLayer};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -175,6 +176,11 @@ fn validation_problem(
 // Handlers
 // ---------------------------------------------------------------------------
 
+/// Redirige la racine vers la documentation Swagger
+async fn handle_root() -> Redirect {
+    Redirect::permanent("/docs/")
+}
+
 /// Vérifie l'état du service
 #[utoipa::path(
     get,
@@ -295,6 +301,38 @@ async fn handle_token(headers: HeaderMap, State(state): State<SharedState>) -> i
 }
 
 // ---------------------------------------------------------------------------
+// CORS
+// ---------------------------------------------------------------------------
+
+/// Construit la couche CORS.
+///
+/// `CORS_ALLOWED_ORIGINS` accepte une liste séparée par des virgules
+/// (ex. `http://localhost:8904,null`) ou `*` pour tout autoriser.
+/// Par défaut : tout autoriser, pratique pour les clients `file://` (Origin: null)
+/// et les serveurs statiques locaux sur un port quelconque.
+fn cors_layer() -> CorsLayer {
+    let raw = std::env::var("CORS_ALLOWED_ORIGINS").unwrap_or_default();
+    let listed: Vec<HeaderValue> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|origin| !origin.is_empty())
+        .filter_map(|origin| HeaderValue::from_str(origin).ok())
+        .collect();
+
+    let layer = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
+        .expose_headers([header::CONTENT_TYPE])
+        .max_age(std::time::Duration::from_secs(3600));
+
+    if raw.contains('*') || listed.is_empty() {
+        layer.allow_origin(Any)
+    } else {
+        layer.allow_origin(listed)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Token utils
 // ---------------------------------------------------------------------------
 
@@ -341,10 +379,12 @@ async fn main() {
 
     let app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", ApiDoc::openapi()))
+        .route("/", get(handle_root))
         .route("/health", get(handle_health))
         .route("/zones", get(handle_list_zones))
         .route("/token", post(handle_token))
         .route("/sync", post(handle_sync))
+        .layer(cors_layer())
         .with_state(state);
 
     let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8085".to_string());
