@@ -67,6 +67,27 @@ Le SOA est généré automatiquement ; il ne fait pas partie des types acceptés
 - Support Docker Compose pour un déploiement rapide
 - Logs structurés via `tracing`
 - API documentée via Swagger UI sur `/docs`
+- Mesure des temps de réponse exposée par en-têtes (`Server-Timing`, `X-Response-Time`, `X-Request-Id`)
+
+### Mesure des temps de réponse
+
+Chaque réponse porte les en-têtes suivants (hors préflight `OPTIONS`, traité par `CorsLayer`) :
+
+```http
+Server-Timing: app;dur=382.2;desc="handler", auth;dur=0.1;desc="authentication", validate;dur=0.1;desc="payload validation", write;dur=0.4;desc="zone file write", checkzone;dur=381.5;desc="named-checkzone"
+X-Response-Time: 382.2ms
+X-Request-Id: d2bd65cb097acb3f
+Timing-Allow-Origin: *
+Access-Control-Expose-Headers: content-type,server-timing,x-response-time,x-request-id,timing-allow-origin
+```
+
+- `app` couvre la requête entière (middleware → réponse prête) ;
+- les étapes mesurent le travail réel : résolution d'auth (dont appels provider), validation du payload, écriture du fichier de zone, `named-checkzone`, `rndc reload`, suppression, génération de token ;
+- les étapes sont cumulées dans l'ordre d'exécution, jamais après l'envoi du corps ;
+- `X-Request-Id` est repris tel quel s'il est fourni par le client (sinon 8 octets hex générés) ;
+- `Access-Control-Expose-Headers` est géré par `CorsLayer::expose_headers`, pas écrasé à la main.
+
+Côté navigateur, `performance.getEntriesByType("resource")[i].serverTiming` expose directement `app`, `checkzone`, etc. ; `Timing-Allow-Origin: *` débloque les temps réseau (DNS, TCP, TLS, TTFB) et `X-Response-Time` reste lisible en XHR.
 
 ## Stack technique
 
