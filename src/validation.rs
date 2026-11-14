@@ -537,7 +537,7 @@ pub fn validate_zone_file_with_named_checkzone(
     zone_file_path: &Path,
 ) -> Result<(), ValidationError> {
     let output = Command::new("named-checkzone")
-        .args(["-q", zone_name, zone_file_path.to_str().unwrap_or("")])
+        .args([zone_name, zone_file_path.to_str().unwrap_or("")])
         .output()
         .map_err(|e| {
             ValidationError::new(
@@ -547,10 +547,19 @@ pub fn validate_zone_file_with_named_checkzone(
         })?;
 
     if !output.status.success() {
+        // `named-checkzone` écrit parfois le diagnostic sur stdout, pas stderr.
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = format!("{} {}", stderr.trim(), stdout.trim());
+        let detail = detail.trim();
+        let detail = if detail.is_empty() {
+            "named-checkzone exited with an error"
+        } else {
+            detail
+        };
         return Err(ValidationError::new(
             ValidationErrorCode::ZoneValidationFailed,
-            format!("named-checkzone validation failed: {}", stderr.trim()),
+            format!("named-checkzone validation failed: {}", detail),
         )
         .with_field("zone_file")
         .with_value(&zone_file_path.display().to_string()));

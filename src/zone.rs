@@ -22,6 +22,31 @@ pub fn compute_serial(existing_serial: Option<i32>) -> i32 {
     now.max(next)
 }
 
+/// Chemin du fichier de zone pour un répertoire de scope donné.
+pub fn zone_file_path(zone_dir: &Path, zone_name: &str) -> PathBuf {
+    zone_dir
+        .join(zone_name)
+        .join(format!("{}.zone", zone_name))
+}
+
+/// Lit le serial actuel d'un fichier de zone (champ 3 de la ligne SOA).
+pub fn read_serial(zone_file: &Path) -> Option<i32> {
+    let content = std::fs::read_to_string(zone_file).ok()?;
+
+    for line in content.lines() {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        if let Some(idx) = tokens
+            .iter()
+            .position(|token| token.eq_ignore_ascii_case("SOA"))
+        {
+            // SOA <mname> <rname> <serial> <refresh> ...
+            return tokens.get(idx + 3).and_then(|s| s.parse().ok());
+        }
+    }
+
+    None
+}
+
 /// Génère le contenu d'un fichier de zone BIND9.
 pub fn generate_zone_file(
     zone_name: &str,
@@ -36,15 +61,26 @@ pub fn generate_zone_file(
 
     // SOA record
     lines.push(format!(
-        "@\t3600\tIN\tSOA\tns.example.invalid. hostmaster.example.invalid. {} 3600 900 604800 86400",
-        serial
+        "@\t3600\tIN\tSOA\tns.{zone}. hostmaster.{zone}. {} 3600 900 604800 86400",
+        serial,
+        zone = zone_name
     ));
 
     if !records
         .iter()
         .any(|record| record.record_type.eq_ignore_ascii_case("NS") && record.name == "@")
     {
-        lines.push("@ 3600 IN NS ns.example.invalid.".into());
+        lines.push(format!("@ 3600 IN NS ns.{}.", zone_name));
+
+        // BIND refuse une zone dont le NS de l'apex n'a aucune adresse :
+        // on injecte un A par défaut si l'utilisateur n'en fournit pas.
+        if !records.iter().any(|record| {
+            record.name.eq_ignore_ascii_case("ns")
+                && (record.record_type.eq_ignore_ascii_case("A")
+                    || record.record_type.eq_ignore_ascii_case("AAAA"))
+        }) {
+            lines.push("ns 3600 IN A 127.0.0.1".into());
+        }
     }
 
     // A records
@@ -116,4 +152,66 @@ pub fn generate_zone_file(
         .map_err(|e| format!("failed to write zone file: {}", e))?;
 
     Ok(zone_file_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zone_file_path_is_scope_ready() {
+        let path = zone_file_path(Path::new("/zones/public"), "alpha.test");
+        assert_eq!(
+            path,
+            PathBuf::from("/zones/public/alpha.test/alpha.test.zone")
+        );
+    }
+
+    #[test]
+    fn read_serial_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("squilladns-zone-{}", std::process::id()));
+        let records = vec![Record {
+            record_type: "A".into(),
+            name: "www".into(),
+            value: "192.0.2.1".into(),
+        }];
+
+        let path = generate_zone_file("alpha.test", &records, 2026010101, &dir).unwrap();
+        assert_eq!(read_serial(&path), Some(2026010101));
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("ns.alpha.test."), "SOA doit utiliser la zone");
+        assert!(content.contains("IN NS ns.alpha.test."));
+        assert!(
+            content.contains("ns 3600 IN A 127.0.0.1"),
+            "un A par défaut est requis pour que BIND charge la zone"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn no_default_a_when_user_provides_ns_address() {
+        let dir = std::env::temp_dir().join(format!("squilladns-ns-{}", std::process::id()));
+        let records = vec![
+            Record {
+                record_type: "NS".into(),
+                name: "ns".into(),
+                value: "ns.alpha.test.".into(),
+            },
+            Record {
+                record_type: "A".into(),
+                name: "ns".into(),
+                value: "192.0.2.53".into(),
+            },
+        ];
+
+        let path = generate_zone_file("alpha.test", &records, 1, &dir).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+
+        assert!(content.contains("ns 3600 IN A 192.0.2.53"));
+        assert!(!content.contains("127.0.0.1"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

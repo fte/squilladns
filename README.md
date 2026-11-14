@@ -18,12 +18,16 @@ Le nom vient de la squille, un crustacé rapide et très observateur, ce qui rap
 
 ### Gestion de zones DNS
 
+- Créer / remplacer une zone via `PUT /zones/{name}`, la supprimer via `DELETE /zones/{name}`
 - Synchroniser les enregistrements reçus par l'API vers un fichier de zone sur disque
-- Générer un SOA automatiquement et ajouter un NS d'apex par défaut si aucun n'est fourni
-- Valider les enregistrements et le fichier final avec `named-checkzone`
+- Générer un SOA automatiquement (mname/rname dérivés de la zone) et ajouter un NS d'apex par défaut si aucun n'est fourni
+- Valider les enregistrements et le fichier final avec `named-checkzone` (ignoré si le binaire est absent)
+- Restaurer le fichier précédent si la validation finale échoue
 - Générer des fichiers `*.zone` destinés à être consommés par BIND9
-- Préparer un layout de travail par domaine (`zones/example.invalid/...`)
-- La liste de zones est exposée par `/zones`, mais son implémentation est encore à compléter
+- Recharger une zone avec `rndc reload` quand `rndc` est disponible
+- Isoler les zones par scope : `public/` pour les appels anonymes, `user-<id>/` pour les appels authentifiés
+- Lister les zones du scope courant via `GET /zones`
+- Serial incrémental relu depuis le fichier de zone existant (`max(jour UTC, serial + 1)`)
 
 ### Types d'enregistrements supportés
 
@@ -43,13 +47,17 @@ Le SOA est généré automatiquement ; il ne fait pas partie des types acceptés
 ### Calcul de serial BIND9
 
 - Le helper de serial applique `max(jour UTC depuis epoch, serial existant + 1)`
-- La route `/sync` ne relit pas encore le serial du fichier existant et appelle actuellement ce helper sans serial précédent
+- Le serial existant est relu dans la ligne SOA du fichier de zone avant réécriture
 
 ### Authentification et sécurité
 
-- Authentification Bearer par token partagé configuré avec `API_TOKEN` ou généré au démarrage
+- Auth optionnelle : sans token, l'appelant est anonyme et travaille dans le scope `public`
+- Avec `Authorization: Bearer <token>`, les zones sont isolées par utilisateur (`private:<id>`)
+- Tokens acceptés : token interne (fichier `API_TOKEN_PATH`), ou token OAuth Google / GitHub / Microsoft vérifié via l'endpoint userinfo du provider
+- Mode sandbox pour le dev local : `SANDBOX_USER=alice` (aucun provider requis)
+- `POST /token` ajoute un token interne au fichier sans invalider les précédents
 - Conservation du token dans `API_TOKEN_PATH`, avec permissions Unix `0600`
-- Protection des routes `/zones`, `/sync` et `/token`
+- CORS configurable via `CORS_ALLOWED_ORIGINS` (ouvert par défaut, y compris `Origin: null` des fichiers locaux)
 - Documentation OpenAPI / Swagger incluse
 
 ### Déploiement et exploitation
@@ -73,13 +81,17 @@ Le SOA est généré automatiquement ; il ne fait pas partie des types acceptés
 
 | Méthode | Chemin | Description | Auth |
 |---------|--------|-------------|------|
-| GET | `/health` | Vérifie l'état du service | — |
-| GET | `/zones` | Liste des zones (implémentation à compléter) | Requise |
-| POST | `/sync` | Valide et écrit le fichier de zone `default` | Requise |
-| POST | `/token` | Génère un nouveau token interne | Requise |
+| GET | `/` | Redirection vers Swagger UI | — |
+| GET | `/health` | Vérifie l'état du service et le mode d'auth | — |
+| GET | `/auth/me` | Identité résolue de l'appelant | Optionnelle |
+| GET | `/zones` | Liste les zones du scope courant | Optionnelle |
+| PUT | `/zones/{name}` | Crée (`201`) ou remplace (`200`) une zone | Optionnelle |
+| DELETE | `/zones/{name}` | Supprime une zone (`204` / `404`) | Optionnelle |
+| POST | `/sync` | Écrit une zone (body JSON) et/ou recharge (`?zone=`) | Optionnelle |
+| POST | `/token` | Ajoute un token interne au fichier | Requise |
 | GET | `/docs` | Interface Swagger UI | — |
 
-La route `/sync` accepte un payload JSON de type :
+Le body JSON des routes d'écriture est de la forme :
 
 ```json
 {
@@ -89,6 +101,8 @@ La route `/sync` accepte un payload JSON de type :
   ]
 }
 ```
+
+`POST /sync` accepte deux usages : avec le body ci-dessus pour (ré)écrire la zone (`?zone=<nom>`, sinon `default`), ou avec le seul paramètre `?zone=<nom>` pour recharger une zone déjà présente sur disque.
 
 ## Démarrage rapide
 
@@ -114,9 +128,12 @@ make logs
 | Variable | Défaut | Description |
 |----------|--------|-------------|
 | `API_ADDR` | `0.0.0.0:8085` | Adresse d'écoute du service |
-| `API_TOKEN` | vide | Token interne préconfiguré si fourni |
-| `API_TOKEN_PATH` | `/app/.api-token` | Emplacement du fichier de token |
-| `ZONES_DIR` | `zones/example.invalid` | Répertoire racine des zones |
+| `API_TOKEN` | vide | Token interne de bootstrap (réécrit au démarrage) |
+| `API_TOKEN_PATH` | `/app/.api-token` | Fichier de tokens internes (un par ligne, `0600`) |
+| `ZONES_DIR` | `zones/example.invalid` | Répertoire racine des zones (`<ZONES_DIR>/<scope>/<zone>/`) |
+| `CORS_ALLOWED_ORIGINS` | `*` | Origines CORS autorisées, séparées par des virgules (`null` pour `file://`) |
+| `SANDBOX_USER` | vide | Mode dev : tout appelant devient cet utilisateur |
+| `AUTH_PROVIDER` | vide | Force la vérification sur un seul provider (`google`, `github`, `microsoft`) |
 
 ## Exemple de consommation
 
@@ -129,7 +146,8 @@ curl http://127.0.0.1:8085/health
 ### Synchroniser une zone
 
 ```bash
-curl -X POST http://127.0.0.1:8085/sync \
+# Écrire la zone (créée si absente)
+curl -X PUT http://127.0.0.1:8085/zones/example.invalid \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer <token>" \
   -d '{
@@ -139,6 +157,18 @@ curl -X POST http://127.0.0.1:8085/sync \
       {"type": "TXT", "name": "@", "value": "v=spf1 include:_spf.google.com ~all"}
     ]
   }'
+
+# Recharger dans BIND9 (rndc reload si disponible)
+curl -X POST "http://127.0.0.1:8085/sync?zone=example.invalid" \
+  -H "Authorization: Bearer <token>"
+```
+
+### Lister et supprimer
+
+```bash
+curl http://127.0.0.1:8085/zones
+curl -X DELETE http://127.0.0.1:8085/zones/example.invalid \
+  -H "Authorization: Bearer <token>"
 ```
 
 ### Générer un token interne
@@ -154,6 +184,7 @@ curl -X POST http://127.0.0.1:8085/token \
 .
 ├── src/
 │   ├── main.rs
+│   ├── auth.rs
 │   ├── validation.rs
 │   └── zone.rs
 ├── zones/
