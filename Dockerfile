@@ -1,4 +1,7 @@
-FROM rust:1.99.1 AS builder
+# Le tag `-bookworm` est obligatoire : `rust:1.99.1` suit désormais Debian
+# trixie (glibc 2.41) et le binaire refuserait de démarrer sur
+# `debian:bookworm-slim` (glibc 2.36, erreur "GLIBC_2.39 not found").
+FROM rust:1.99.1-bookworm AS builder
 WORKDIR /app
 
 # Tous les chemins temporaires dans /app — rien dans /tmp
