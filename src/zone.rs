@@ -2,11 +2,10 @@ use std::path::{Path, PathBuf};
 
 use crate::Record;
 
-/// Chemin racine des zones pour 575.be
+/// Chemin racine des zones pour example.invalid
 pub fn zones_dir() -> PathBuf {
     PathBuf::from(
-        std::env::var("ZONES_DIR")
-            .unwrap_or_else(|_| "zones/575.be".to_string()),
+        std::env::var("ZONES_DIR").unwrap_or_else(|_| "zones/example.invalid".to_string()),
     )
 }
 
@@ -31,41 +30,47 @@ pub fn generate_zone_file(
     zone_dir: &Path,
 ) -> Result<PathBuf, String> {
     let zone_path = zone_dir.join(zone_name);
-    std::fs::create_dir_all(&zone_path)
-        .map_err(|e| format!("failed to create zone dir: {}", e))?;
+    std::fs::create_dir_all(&zone_path).map_err(|e| format!("failed to create zone dir: {}", e))?;
 
     let mut lines: Vec<String> = Vec::new();
 
     // SOA record
     lines.push(format!(
-        "@\t3600\tIN\tSOA\tns.575.be. hostmaster.575.be. {} 3600 900 604800 86400",
+        "@\t3600\tIN\tSOA\tns.example.invalid. hostmaster.example.invalid. {} 3600 900 604800 86400",
         serial
     ));
 
+    if !records
+        .iter()
+        .any(|record| record.record_type.eq_ignore_ascii_case("NS") && record.name == "@")
+    {
+        lines.push("@ 3600 IN NS ns.example.invalid.".into());
+    }
+
     // A records
     for r in records {
-        if r.r#type == "A" {
+        if r.record_type == "A" {
             lines.push(format!("{} 3600 IN A {}", r.name, r.value));
         }
     }
 
     // AAAA records
     for r in records {
-        if r.r#type == "AAAA" {
+        if r.record_type == "AAAA" {
             lines.push(format!("{} 3600 IN AAAA {}", r.name, r.value));
         }
     }
 
     // CNAME records
     for r in records {
-        if r.r#type == "CNAME" {
+        if r.record_type == "CNAME" {
             lines.push(format!("{} 3600 IN CNAME {}", r.name, r.value));
         }
     }
 
     // MX records
     for r in records {
-        if r.r#type == "MX" {
+        if r.record_type == "MX" {
             let priority = r.value.split_whitespace().next().unwrap_or("10");
             let target = r.value.split_whitespace().nth(1).unwrap_or("");
             lines.push(format!("{} 3600 IN MX {} {}", r.name, priority, target));
@@ -74,21 +79,21 @@ pub fn generate_zone_file(
 
     // NS records
     for r in records {
-        if r.r#type == "NS" {
+        if r.record_type == "NS" {
             lines.push(format!("{} 3600 IN NS {}", r.name, r.value));
         }
     }
 
     // TXT records
     for r in records {
-        if r.r#type == "TXT" {
+        if r.record_type == "TXT" {
             lines.push(format!("{} 3600 IN TXT {}", r.name, r.value));
         }
     }
 
     // SRV records : value = "priority weight port target"
     for r in records {
-        if r.r#type == "SRV" {
+        if r.record_type == "SRV" {
             let parts: Vec<&str> = r.value.split_whitespace().collect();
             if parts.len() >= 4 {
                 lines.push(format!(
@@ -101,7 +106,7 @@ pub fn generate_zone_file(
 
     // CAA records
     for r in records {
-        if r.r#type == "CAA" {
+        if r.record_type == "CAA" {
             lines.push(format!("{} 3600 IN CAA {}", r.name, r.value));
         }
     }

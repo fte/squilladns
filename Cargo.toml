@@ -4,14 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-hyper = { version = "1.12", features = ["http1", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+axum = "0.7"
 tokio = { version = "1.54", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
 hickory-server = "0.25"
 hickory-proto = "0.25"
 hickory-client = "0.25"
-http-body-util = "0.1"
-bytes = "1"
 http = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -20,3 +19,6 @@ serde_json = "1"
 urlencoding = "2"
 walkdir = "2"
 rand = "0.8"
+utoipa = { version = "4", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "7", features = ["axum"] }
+thiserror = "2"
