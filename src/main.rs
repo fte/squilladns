@@ -1,3 +1,4 @@
+mod validation;
 mod zone;
 
 use std::fs;
@@ -16,8 +17,10 @@ use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
+use validation::{validate_zone_payload, ProblemDetails, ValidationErrorCode};
+
 const VERSION: &str = "0.1.0";
-const ZONES_DIR: &str = "zones/575.be";
+const ZONES_DIR: &str = "zones/example.invalid";
 
 // ---------------------------------------------------------------------------
 // OpenAPI spec
@@ -30,18 +33,15 @@ const ZONES_DIR: &str = "zones/575.be";
         version = "0.1.0",
         description = "DNS zone management API"
     ),
-    paths(
-        handle_health,
-        handle_list_zones,
-        handle_token,
-        handle_sync,
-    ),
+    paths(handle_health, handle_list_zones, handle_token, handle_sync,),
     components(schemas(
         HealthResponse,
         ZonesResponse,
         TokenResponse,
         SyncResponse,
         ErrorResponse,
+        ProblemDetails,
+        ValidationErrorCode,
         Record,
         ZonePayload,
     ))
@@ -110,37 +110,65 @@ type SharedState = Arc<AppState>;
 // Middleware d'authentification (extracteur manuel)
 // ---------------------------------------------------------------------------
 
-fn check_auth(headers: &HeaderMap, token_path: &Path) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+fn check_auth(
+    headers: &HeaderMap,
+    token_path: &Path,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     let auth = headers
         .get("authorization")
-        .and_then(|v| v.to_str().ok())
+        .and_then(|value| value.to_str().ok())
         .unwrap_or("");
 
     if auth.is_empty() {
         return Err((
             StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse { error: "missing authorization header".into() }),
+            Json(ErrorResponse {
+                error: "missing authorization header".into(),
+            }),
         ));
     }
 
-    if !token_path.exists() {
-        return Err((
+    let stored = fs::read_to_string(token_path).map_err(|_| {
+        (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: "token not configured".into() }),
-        ));
-    }
-
-    let stored = fs::read_to_string(token_path).unwrap_or_default();
-    let bearer = auth.trim_start_matches("Bearer ").trim();
+            Json(ErrorResponse {
+                error: "token not configured".into(),
+            }),
+        )
+    })?;
+    let bearer = auth.strip_prefix("Bearer ").unwrap_or(auth).trim();
 
     if stored.trim() != bearer {
         return Err((
             StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse { error: "invalid token".into() }),
+            Json(ErrorResponse {
+                error: "invalid token".into(),
+            }),
         ));
     }
 
     Ok(())
+}
+
+fn problem(
+    status: StatusCode,
+    title: &str,
+    detail: &str,
+    instance: &str,
+) -> axum::response::Response {
+    let body = ProblemDetails::new(status.as_u16(), title)
+        .with_detail(detail)
+        .with_instance(instance);
+    (status, Json(body)).into_response()
+}
+
+fn validation_problem(
+    errors: &[validation::ValidationError],
+    instance: &str,
+) -> axum::response::Response {
+    let body = validation::validation_errors_to_problem_details(errors, Some(instance));
+    let status = StatusCode::from_u16(body.status).unwrap_or(StatusCode::BAD_REQUEST);
+    (status, Json(body)).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -177,50 +205,24 @@ async fn handle_list_zones(
     headers: HeaderMap,
     State(state): State<SharedState>,
 ) -> impl IntoResponse {
-    if let Err(e) = check_auth(&headers, &state.token_path) {
-        return e.into_response();
+    if let Err(error) = check_auth(&headers, &state.token_path) {
+        return error.into_response();
     }
 
     Json(ZonesResponse { zones: vec![] }).into_response()
 }
 
-/// Génère ou renouvelle le token d'API
-#[utoipa::path(
-    post,
-    path = "/token",
-    responses(
-        (status = 201, description = "Token créé", body = TokenResponse),
-        (status = 401, description = "Non autorisé", body = ErrorResponse),
-    ),
-    security(("bearer_token" = []))
-)]
-async fn handle_token(
-    headers: HeaderMap,
-    State(state): State<SharedState>,
-) -> impl IntoResponse {
-    if let Err(e) = check_auth(&headers, &state.token_path) {
-        return e.into_response();
-    }
-
-    let secret = generate_token();
-    write_token(&state.token_path, &secret);
-
-    (
-        StatusCode::CREATED,
-        Json(TokenResponse { created: true, token: secret }),
-    )
-        .into_response()
-}
-
-/// Synchronise les zones avec le serveur DNS primaire
+/// Valide et écrit le fichier de zone DNS
 #[utoipa::path(
     post,
     path = "/sync",
     request_body = ZonePayload,
     responses(
-        (status = 200, description = "Synchronisation effectuée", body = SyncResponse),
-        (status = 400, description = "Payload invalide", body = ErrorResponse),
+        (status = 200, description = "Zone synchronisée", body = SyncResponse),
+        (status = 400, description = "Payload invalide", body = ProblemDetails),
         (status = 401, description = "Non autorisé", body = ErrorResponse),
+        (status = 422, description = "Zone invalide", body = ProblemDetails),
+        (status = 500, description = "Erreur interne", body = ProblemDetails),
     ),
     security(("bearer_token" = []))
 )]
@@ -229,26 +231,67 @@ async fn handle_sync(
     State(state): State<SharedState>,
     Json(payload): Json<ZonePayload>,
 ) -> impl IntoResponse {
-    if let Err(e) = check_auth(&headers, &state.token_path) {
-        return e.into_response();
+    if let Err(error) = check_auth(&headers, &state.token_path) {
+        return error.into_response();
     }
 
-    let serial = zone::compute_serial(None).to_string();
-    let zone_dir = zone::zones_dir();
-
-    match zone::generate_zone_file("default", &payload.records, zone::compute_serial(None), &zone_dir) {
-        Ok(_) => Json(SyncResponse {
-            status: "synced".into(),
-            zone: "default".into(),
-            serial,
-        })
-        .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-            .into_response(),
+    if let Err(errors) = validate_zone_payload(&payload) {
+        return validation_problem(&errors, "/sync");
     }
+
+    let zone_name = "default";
+    let serial = zone::compute_serial(None);
+    let zone_file =
+        match zone::generate_zone_file(zone_name, &payload.records, serial, &zone::zones_dir()) {
+            Ok(path) => path,
+            Err(error) => {
+                return problem(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal Server Error",
+                    &error,
+                    "/sync",
+                );
+            }
+        };
+
+    if let Err(error) = validation::validate_zone_file_with_named_checkzone(zone_name, &zone_file) {
+        return validation_problem(&[error], "/sync");
+    }
+
+    Json(SyncResponse {
+        status: "synced".into(),
+        zone: zone_name.into(),
+        serial: serial.to_string(),
+    })
+    .into_response()
+}
+
+/// Génère ou renouvelle le token d'API
+#[utoipa::path(
+    post,
+    path = "/token",
+    responses(
+        (status = 201, description = "Token créé", body = TokenResponse),
+        (status = 401, description = "Authentification requise", body = ErrorResponse),
+    ),
+    security(("bearer_token" = []))
+)]
+async fn handle_token(headers: HeaderMap, State(state): State<SharedState>) -> impl IntoResponse {
+    if let Err(error) = check_auth(&headers, &state.token_path) {
+        return error.into_response();
+    }
+
+    let secret = generate_token();
+    write_token(&state.token_path, &secret);
+
+    (
+        StatusCode::CREATED,
+        Json(TokenResponse {
+            created: true,
+            token: secret,
+        }),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -305,12 +348,19 @@ async fn main() {
         .with_state(state);
 
     let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8085".to_string());
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap_or_else(|e| {
-        eprintln!("bind {}: {}", addr, e);
-        std::process::exit(1);
-    });
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("bind {}: {}", addr, e);
+            std::process::exit(1);
+        });
 
-    tracing::info!("squilladns {} on {} — docs: http://{}/docs", VERSION, addr, addr);
+    tracing::info!(
+        "squilladns {} on {} — docs: http://{}/docs",
+        VERSION,
+        addr,
+        addr
+    );
 
     axum::serve(listener, app).await.unwrap_or_else(|e| {
         eprintln!("server error: {}", e);

@@ -80,7 +80,7 @@ endef
 
 .DEFAULT_GOAL := help
 
-.PHONY: help runtime build up down restart logs ps clean fclean
+.PHONY: help runtime build up down restart logs ps clean fclean test test-list test-watch
 
 help: ## Affiche cette aide
 	@printf '\n\033[1mSquillaDNS — Makefile\033[0m\n\n'
@@ -187,3 +187,24 @@ else
 	docker builder prune -f 2>/dev/null || true
 endif
 	@printf '\033[1;32m✓ Nettoyage complet terminé\033[0m\n'
+
+# ── test ─────────────────────────────────────────────────────────────────────
+
+test: ## Lance tous les tests (cargo test)
+	cargo test -- --nocapture
+
+test-list: ## Liste tous les tests disponibles (dynamiquement depuis le code)
+	@printf '\nTests disponibles\n\n'
+	@cargo test -- --list 2>&1 | grep -E '^validation::tests::' | while IFS= read -r line; do \
+		name=$${line%%: test}; \
+		printf '  %s\n' "$$name"; \
+	done
+	@printf '\n'
+
+test-watch: ## Lance les tests en mode watch (nécessite cargo-watch)
+	cargo watch -x test
+
+# ── dev ──────────────────────────────────────────────────────────────────────
+
+dev: ## Lance en mode développement (hot reload avec cargo-watch)
+	cargo watch -x run

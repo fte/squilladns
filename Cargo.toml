@@ -21,3 +21,4 @@ walkdir = "2"
 rand = "0.8"
 utoipa = { version = "4", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "7", features = ["axum"] }
+thiserror = "2"
