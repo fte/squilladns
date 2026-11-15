@@ -6,13 +6,15 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 use axum::{
     body::Bytes,
-    extract::{Path as UrlPath, Query, State},
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
-    response::{IntoResponse, Redirect},
+    extract::{Extension, Path as UrlPath, Query, Request, State},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post, put},
     Json, Router,
 };
@@ -25,6 +27,11 @@ use auth::{resolve_user, AuthUser};
 use validation::{validate_zone_payload, ProblemDetails, ValidationErrorCode};
 
 const VERSION: &str = "0.1.0";
+
+const HEADER_SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
+const HEADER_RESPONSE_TIME: HeaderName = HeaderName::from_static("x-response-time");
+const HEADER_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
+const HEADER_TIMING_ALLOW_ORIGIN: HeaderName = HeaderName::from_static("timing-allow-origin");
 
 // ---------------------------------------------------------------------------
 // OpenAPI spec
@@ -152,6 +159,113 @@ struct AppState {
 }
 
 type SharedState = Arc<AppState>;
+
+// ---------------------------------------------------------------------------
+// Mesure des temps de réponse (`Server-Timing`)
+// ---------------------------------------------------------------------------
+
+/// Sous-mesures accumulées pendant une requête (auth, disque, `named-checkzone`,
+/// `rndc`…), transformées en en-tête `Server-Timing` par le middleware.
+#[derive(Clone, Default)]
+struct Timings(Arc<Mutex<Vec<(&'static str, f64)>>>);
+
+impl Timings {
+    /// Enregistre une étape en millisecondes.
+    fn record(&self, step: &'static str, elapsed: std::time::Duration) {
+        if let Ok(mut steps) = self.0.lock() {
+            steps.push((step, elapsed.as_secs_f64() * 1000.0));
+        }
+    }
+
+    /// `app;dur=12.4;desc="handler", write;dur=1.2;desc="zone file write"`
+    fn header_value(&self, total_ms: f64) -> String {
+        let mut parts = vec![format!("app;dur={:.1};desc=\"handler\"", total_ms)];
+
+        if let Ok(steps) = self.0.lock() {
+            for (name, dur) in steps.iter() {
+                parts.push(format!("{};dur={:.1};desc=\"{}\"", name, dur, step_label(name)));
+            }
+        }
+
+        parts.join(", ")
+    }
+}
+
+fn step_label(step: &str) -> &str {
+    match step {
+        "auth" => "authentication",
+        "validate" => "payload validation",
+        "list" => "list zones",
+        "write" => "zone file write",
+        "checkzone" => "named-checkzone",
+        "rndc" => "rndc reload",
+        "delete" => "delete zone",
+        "token" => "token generation",
+        other => other,
+    }
+}
+
+/// Exécute `f` en enregistrant sa durée.
+fn timed<T>(timings: &Timings, step: &'static str, f: impl FnOnce() -> T) -> T {
+    let start = Instant::now();
+    let value = f();
+    timings.record(step, start.elapsed());
+    value
+}
+
+/// Variante asynchrone (résolution de token auprès d'un provider = I/O réseau).
+async fn timed_async<T, F>(timings: &Timings, step: &'static str, future: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let start = Instant::now();
+    let value = future.await;
+    timings.record(step, start.elapsed());
+    value
+}
+
+/// Reprend l'identifiant de corrélation du client s'il est plausible,
+/// sinon en génère un (8 octets hex).
+fn request_id(headers: &HeaderMap) -> String {
+    headers
+        .get(&HEADER_REQUEST_ID)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && id.len() <= 128 && id.chars().all(|c| c.is_ascii_graphic()))
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let bytes: [u8; 8] = std::array::from_fn(|_| rand::random::<u8>());
+            bytes.iter().map(|byte| format!("{:02x}", byte)).collect()
+        })
+}
+
+/// Middleware : mesure la durée totale et publie les en-têtes de timing.
+///
+/// Il doit rester sous `CorsLayer` pour que les `expose_headers` s'appliquent.
+async fn server_timing(mut request: Request, next: Next) -> Response {
+    let start = Instant::now();
+    let timings = Timings::default();
+    request.extensions_mut().insert(timings.clone());
+    let request_id = request_id(request.headers());
+
+    let mut response = next.run(request).await;
+    let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    let headers = response.headers_mut();
+
+    if let Ok(value) = HeaderValue::from_str(&timings.header_value(total_ms)) {
+        headers.insert(HEADER_SERVER_TIMING, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&format!("{:.1}ms", total_ms)) {
+        headers.insert(HEADER_RESPONSE_TIME, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        headers.insert(HEADER_REQUEST_ID, value);
+    }
+    headers.insert(HEADER_TIMING_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+
+    response
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -383,8 +497,18 @@ async fn handle_health() -> impl IntoResponse {
     ),
     security(("bearer_token" = []))
 )]
-async fn handle_me(headers: HeaderMap, State(state): State<SharedState>) -> impl IntoResponse {
-    match resolve_caller(&headers, &state.token_path).await {
+async fn handle_me(
+    headers: HeaderMap,
+    State(state): State<SharedState>,
+    Extension(timings): Extension<Timings>,
+) -> impl IntoResponse {
+    match timed_async(
+        &timings,
+        "auth",
+        resolve_caller(&headers, &state.token_path),
+    )
+    .await
+    {
         Some(user) => Json(MeResponse {
             authenticated: true,
             id: Some(user.id),
@@ -417,11 +541,17 @@ async fn handle_me(headers: HeaderMap, State(state): State<SharedState>) -> impl
 async fn handle_list_zones(
     headers: HeaderMap,
     State(state): State<SharedState>,
+    Extension(timings): Extension<Timings>,
 ) -> impl IntoResponse {
-    let user = resolve_caller(&headers, &state.token_path).await;
+    let user = timed_async(
+        &timings,
+        "auth",
+        resolve_caller(&headers, &state.token_path),
+    )
+    .await;
     let root = zone_root(&user);
 
-    match list_zones(&root) {
+    match timed(&timings, "list", || list_zones(&root)) {
         Ok(zones) => Json(ZonesResponse {
             zones,
             scope: scope_of(&user),
@@ -456,18 +586,24 @@ async fn handle_list_zones(
 async fn handle_put_zone(
     headers: HeaderMap,
     State(state): State<SharedState>,
+    Extension(timings): Extension<Timings>,
     UrlPath(name): UrlPath<String>,
     Json(payload): Json<ZonePayload>,
 ) -> impl IntoResponse {
     let instance = format!("/zones/{}", name);
-    let user = resolve_caller(&headers, &state.token_path).await;
+    let user = timed_async(
+        &timings,
+        "auth",
+        resolve_caller(&headers, &state.token_path),
+    )
+    .await;
 
     let zone_name = match normalized_zone_name(&name) {
         Ok(zone_name) => zone_name,
         Err(error) => return validation_problem(&[error], &instance),
     };
 
-    if let Err(errors) = validate_zone_payload(&payload) {
+    if let Err(errors) = timed(&timings, "validate", || validate_zone_payload(&payload)) {
         return validation_problem(&errors, &instance);
     }
 
@@ -477,7 +613,9 @@ async fn handle_put_zone(
     let previous = fs::read_to_string(&zone_file).ok();
     let serial = zone::compute_serial(zone::read_serial(&zone_file));
 
-    let written = match zone::generate_zone_file(&zone_name, &payload.records, serial, &root) {
+    let written = match timed(&timings, "write", || {
+        zone::generate_zone_file(&zone_name, &payload.records, serial, &root)
+    }) {
         Ok(path) => path,
         Err(error) => {
             return problem(
@@ -489,7 +627,9 @@ async fn handle_put_zone(
         }
     };
 
-    if let Err(error) = check_zone_file(&zone_name, &written) {
+    if let Err(error) = timed(&timings, "checkzone", || {
+        check_zone_file(&zone_name, &written)
+    }) {
         restore_zone(&root, &zone_name, &zone_file, previous);
         return validation_problem(&[error], &instance);
     }
@@ -529,10 +669,16 @@ async fn handle_put_zone(
 async fn handle_delete_zone(
     headers: HeaderMap,
     State(state): State<SharedState>,
+    Extension(timings): Extension<Timings>,
     UrlPath(name): UrlPath<String>,
 ) -> impl IntoResponse {
     let instance = format!("/zones/{}", name);
-    let user = resolve_caller(&headers, &state.token_path).await;
+    let user = timed_async(
+        &timings,
+        "auth",
+        resolve_caller(&headers, &state.token_path),
+    )
+    .await;
 
     let zone_name = match normalized_zone_name(&name) {
         Ok(zone_name) => zone_name,
@@ -544,7 +690,7 @@ async fn handle_delete_zone(
         return err(StatusCode::NOT_FOUND, "zone not found");
     }
 
-    match fs::remove_dir_all(&zone_path) {
+    match timed(&timings, "delete", || fs::remove_dir_all(&zone_path)) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => problem(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -576,12 +722,18 @@ async fn handle_delete_zone(
 async fn handle_sync(
     headers: HeaderMap,
     State(state): State<SharedState>,
+    Extension(timings): Extension<Timings>,
     Query(query): Query<SyncQuery>,
     body: Bytes,
 ) -> impl IntoResponse {
     const INSTANCE: &str = "/sync";
 
-    let user = resolve_caller(&headers, &state.token_path).await;
+    let user = timed_async(
+        &timings,
+        "auth",
+        resolve_caller(&headers, &state.token_path),
+    )
+    .await;
 
     let payload = if body.is_empty() {
         None
@@ -614,14 +766,15 @@ async fn handle_sync(
 
     let serial = match payload {
         Some(payload) => {
-            if let Err(errors) = validate_zone_payload(&payload) {
+            if let Err(errors) = timed(&timings, "validate", || validate_zone_payload(&payload)) {
                 return validation_problem(&errors, INSTANCE);
             }
 
             let serial = zone::compute_serial(zone::read_serial(&zone_file));
             let previous = fs::read_to_string(&zone_file).ok();
-            let written = match zone::generate_zone_file(&zone_name, &payload.records, serial, &root)
-            {
+            let written = match timed(&timings, "write", || {
+                zone::generate_zone_file(&zone_name, &payload.records, serial, &root)
+            }) {
                 Ok(path) => path,
                 Err(error) => {
                     return problem(
@@ -633,7 +786,9 @@ async fn handle_sync(
                 }
             };
 
-            if let Err(error) = check_zone_file(&zone_name, &written) {
+            if let Err(error) = timed(&timings, "checkzone", || {
+                check_zone_file(&zone_name, &written)
+            }) {
                 restore_zone(&root, &zone_name, &zone_file, previous);
                 return validation_problem(&[error], INSTANCE);
             }
@@ -651,7 +806,7 @@ async fn handle_sync(
         },
     };
 
-    let reloaded = rndc_reload(&zone_name);
+    let reloaded = timed(&timings, "rndc", || rndc_reload(&zone_name));
 
     Json(SyncResponse {
         status: if reloaded { "reloaded" } else { "synced" }.into(),
@@ -679,9 +834,16 @@ async fn handle_sync(
 async fn handle_token(
     headers: HeaderMap,
     State(state): State<SharedState>,
+    Extension(timings): Extension<Timings>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let Some(user) = resolve_caller(&headers, &state.token_path).await else {
+    let Some(user) = timed_async(
+        &timings,
+        "auth",
+        resolve_caller(&headers, &state.token_path),
+    )
+    .await
+    else {
         return err(StatusCode::UNAUTHORIZED, "authentication required");
     };
 
@@ -706,7 +868,7 @@ async fn handle_token(
         }
     }
 
-    let secret = generate_token();
+    let secret = timed(&timings, "token", generate_token);
     append_token(&state.token_path, &secret);
 
     (
@@ -741,7 +903,15 @@ fn cors_layer() -> CorsLayer {
     let layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
-        .expose_headers([header::CONTENT_TYPE])
+        // Sans ces expositions, le navigateur masque les en-têtes de timing
+        // et `performance.*.serverTiming` reste vide.
+        .expose_headers([
+            header::CONTENT_TYPE,
+            HEADER_SERVER_TIMING.clone(),
+            HEADER_RESPONSE_TIME.clone(),
+            HEADER_REQUEST_ID.clone(),
+            HEADER_TIMING_ALLOW_ORIGIN.clone(),
+        ])
         .max_age(std::time::Duration::from_secs(3600));
 
     if raw.contains('*') || listed.is_empty() {
@@ -843,6 +1013,7 @@ async fn main() {
         )
         .route("/sync", post(handle_sync))
         .route("/token", post(handle_token))
+        .layer(middleware::from_fn(server_timing))
         .layer(cors_layer())
         .with_state(state);
 
@@ -866,4 +1037,48 @@ async fn main() {
         eprintln!("server error: {}", e);
         std::process::exit(1);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn server_timing_lists_total_then_steps() {
+        let timings = Timings::default();
+        timings.record("write", Duration::from_millis(2));
+        timings.record("checkzone", Duration::from_micros(1500));
+
+        assert_eq!(
+            timings.header_value(12.44),
+            "app;dur=12.4;desc=\"handler\", \
+             write;dur=2.0;desc=\"zone file write\", \
+             checkzone;dur=1.5;desc=\"named-checkzone\""
+        );
+    }
+
+    #[test]
+    fn server_timing_without_steps_has_only_app() {
+        assert_eq!(
+            Timings::default().header_value(0.42),
+            "app;dur=0.4;desc=\"handler\""
+        );
+    }
+
+    #[test]
+    fn request_id_reuses_client_value_and_rejects_junk() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(request_id(&headers).len(), 16, "id généré = 8 octets hex");
+
+        headers.insert(HEADER_REQUEST_ID, HeaderValue::from_static("abc-123"));
+        assert_eq!(request_id(&headers), "abc-123");
+
+        headers.insert(HEADER_REQUEST_ID, HeaderValue::from_static("bad id"));
+        assert_eq!(
+            request_id(&headers).len(),
+            16,
+            "un id avec espace est remplacé"
+        );
+    }
 }
