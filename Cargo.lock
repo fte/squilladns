@@ -1499,6 +1499,7 @@ name = "squilladns"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "hickory-client",
  "hickory-proto",
  "hickory-server",
@@ -1507,6 +1508,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.21",
  "tokio",
  "tower",

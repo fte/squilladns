@@ -24,9 +24,7 @@ pub fn compute_serial(existing_serial: Option<i32>) -> i32 {
 
 /// Chemin du fichier de zone pour un répertoire de scope donné.
 pub fn zone_file_path(zone_dir: &Path, zone_name: &str) -> PathBuf {
-    zone_dir
-        .join(zone_name)
-        .join(format!("{}.zone", zone_name))
+    zone_dir.join(zone_name).join(format!("{}.zone", zone_name))
 }
 
 /// Lit le serial actuel d'un fichier de zone (champ 3 de la ligne SOA).
@@ -180,7 +178,10 @@ mod tests {
         assert_eq!(read_serial(&path), Some(2026010101));
 
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(content.contains("ns.alpha.test."), "SOA doit utiliser la zone");
+        assert!(
+            content.contains("ns.alpha.test."),
+            "SOA doit utiliser la zone"
+        );
         assert!(content.contains("IN NS ns.alpha.test."));
         assert!(
             content.contains("ns 3600 IN A 127.0.0.1"),
