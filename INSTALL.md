@@ -1,265 +1,86 @@
-# Installation et déploiement SquillaDNS
-
-## Objectif
-
-Ce document décrit les étapes de déploiement de SquillaDNS en environnement local, Docker, et production légère. Il complète le [README.md](./README.md) en se concentrant sur l'installation, la configuration, l'exploitation et les bonnes pratiques de mise en service.
+# Installation et exploitation
 
 ## Prérequis
 
-- Rust 1.70+ (si compilation locale)
-- Docker 24+ ou Docker Compose v2
-- `named-checkzone` (fourni par `bind9-utils` dans l'image Docker du projet)
-- Accessibilité réseau sur le port `8085`
-- Un stockage persistant pour les fichiers de zone si le service doit survivre à un reboot
-- Un secret d'API / token si l'API est exposée à des clients non-trustés
+- Docker Compose v2, ou Rust 1.70+ pour l’exécution locale.
+- Port 8085 disponible.
+- Un volume persistant pour les zones et l’état des tokens.
 
-## Variables d'environnement
+L’image inclut named-checkzone. rndc n’est actif que si l’environnement le
+configure ; l’API ne remplace pas la déclaration des zones dans named.conf.
 
-| Variable | Défaut | Description |
-|----------|--------|-------------|
-| `API_ADDR` | `0.0.0.0:8085` | Adresse d'écoute du service |
-| `API_TOKEN` | vide | Token racine. Vide : généré au démarrage, écrit dans `API_TOKEN_PATH` et affiché dans les logs |
-| `API_TOKEN_PATH` | `.state/tokens` | Fichier de tokens (`<tenant>\t<slug>\t<token>` par ligne, `0600`, anciens formats migrés) |
-| `ZONES_DIR` | `zones/example.invalid` | Répertoire racine des zones (`public/` et `tenants/<tenant>/`) |
-| `JWT_SECRET` | vide | Secret HS256 (≥ 32 octets) partagé avec le front ; sans lui, les JWT sont refusés |
-| `SANDBOX_USER` | vide | Mode dev : auth court-circuitée, tout appelant devient cet utilisateur |
+## Configuration
 
-## Modes d'installation
+| Variable | Défaut | Rôle |
+|---|---|---|
+| API_ADDR | 0.0.0.0:8085 | Adresse d’écoute |
+| API_TOKEN | vide | Token bootstrap ; vide = génération au démarrage |
+| API_TOKEN_PATH | .state/tokens | Stockage local des tokens, permissions 0600 |
+| ZONES_DIR | zones/example.invalid | Racine des fichiers de zones |
+| JWT_SECRET | vide | Secret HS256 partagé avec le BFF, minimum 32 octets |
+| CORS_ALLOWED_ORIGINS | * | Origines séparées par des virgules ; null autorise file:// |
+| SANDBOX_USER | vide | Identité de développement, auth désactivée |
+| RUST_LOG | info | Filtre tracing |
 
-### 1. Déploiement local via Cargo
+Sans API_TOKEN, le secret généré est écrit dans API_TOKEN_PATH et affiché une
+fois dans les logs. Le fichier contient les credentials en clair ; protège le
+volume et les logs.
 
-```bash
-cargo build --release
-API_ADDR=0.0.0.0:8085 \
-API_TOKEN="$(openssl rand -hex 32)" \
-ZONES_DIR=./zones/example.invalid \
-./target/release/squilladns
-```
+## Docker Compose
 
-Puis vérifier :
-
-```bash
-curl -fsS http://127.0.0.1:8085/health
-```
-
-### 2. Déploiement via Docker Compose
-
-Le projet fournit un `docker-compose.yml`. Définis `API_TOKEN` avant le démarrage :
-
-```bash
-export API_TOKEN="$(openssl rand -hex 32)"
+~~~sh
+export API_TOKEN="$(openssl rand -hex 32)" # recommandé pour un déploiement stable
 docker compose up --build -d
-```
-
-Sans cette variable, la configuration Compose de développement peut utiliser un token de démonstration. Ne l'expose jamais sur un réseau non fiable.
-
-Le service écoute sur :
-
-```bash
-http://127.0.0.1:8085
-```
-
-Vérification :
-
-```bash
 curl -fsS http://127.0.0.1:8085/health
-```
+docker compose logs
+~~~
 
-### 3. Déploiement via Makefile
+Compose persiste zones et tokens via ./zones et ./.state. Omettre API_TOKEN
+est possible : le fichier d’état conserve le token généré entre les redémarrages.
 
-```bash
-make up API_TOKEN="$(openssl rand -hex 32)"
-```
+Opérations usuelles :
 
-Les cibles utiles :
+~~~sh
+docker compose logs -f
+docker compose restart
+docker compose down
+~~~
 
-```bash
-make build
-make logs
-make down
-make restart
-make ps
-```
+## Exécution locale
 
-## Sécurité et tokens
-
-Le service autorise un mode de sécurité avec token interne. Au démarrage, si `API_TOKEN` est absent et qu'aucun fichier de token n'est présent, SquillaDNS en crée un automatiquement et l'écrit sur `API_TOKEN_PATH` avec permissions `0600`.
-
-Le token de bootstrap (`API_TOKEN`) possède son propre tenant, stable même si le fichier de tokens est perdu. Les tokens créés via `POST /token` héritent du compte authentifié ; plusieurs tokens de ce compte retrouvent donc les mêmes zones.
-
-Exemple de lancement sécurisé :
-
-```bash
+~~~sh
 export API_TOKEN="$(openssl rand -hex 32)"
-export API_ADDR="0.0.0.0:8085"
-export ZONES_DIR="./zones/example.invalid"
-docker compose up -d
-```
+export ZONES_DIR=./zones/example.invalid
+cargo run --release
+~~~
 
-Le fichier de tokens (`API_TOKEN_PATH`, `.state/tokens` par défaut, `/app/state/tokens` dans le conteneur) est stocké en clair avec des permissions Unix restrictives (`0600`) ; il n'est pas chiffré. Protège le volume et ne publie jamais ce fichier :
+Le mode sandbox est réservé au développement local :
 
-```bash
-ls -l .state/tokens
-```
-
-## Gestion des zones
-
-Les zones sont générées dans le répertoire configuré par `ZONES_DIR`.
-
-Exemple de structure :
-
-```text
-zones/
-└── example.invalid/
-    └── default/
-        └── default.zone
-```
-
-Le fichier de zone est écrit au format BIND9 standard. Le SOA et, si nécessaire, le NS d'apex sont générés automatiquement. Les enregistrements pris en charge sont :
-
-- SOA
-- A / AAAA
-- MX / NS
-- TXT / CAA
-- CNAME
-- SRV
+~~~sh
+SANDBOX_USER=alice cargo run
+~~~
 
 ## Authentification
 
-L'authentification est **optionnelle** : sans header `Authorization`, l'appelant travaille dans le scope public. Avec un Bearer valide, il travaille dans son propre tenant (`scope: "private"`).
+Le flux SSO et les claims JWT sont spécifiés dans [AUTH.md](AUTH.md).
+Pour un appel script, utiliser un token API dans Authorization: Bearer <token>.
+Une authentification absente ouvre le scope public ; un credential invalide
+renvoie 401.
 
-Deux mécanismes acceptés :
+## Stockage et migration
 
-- **token API** (`sqi_…`), stocké dans `API_TOKEN_PATH` ;
-- **JWT HS256** émis par ton front après un SSO GitHub/Azure/Google (voir [AUTH.md](./AUTH.md)).
+Les zones sont écrites sous ZONES_DIR/public ou ZONES_DIR/tenants/<id-interne>.
+L’identifiant interne n’est pas exposé par l’API. Les anciens répertoires de
+tenant hashés sont déplacés au premier appel JWT. Les répertoires user-* de
+versions antérieures nécessitent une migration manuelle.
 
-```bash
-curl -H "Authorization: Bearer <token>" http://127.0.0.1:8085/zones
-```
+Le fichier API_TOKEN_PATH accepte les anciens formats et les migre au chargement.
 
-Un credential invalide renvoie `401` en `problem+json` (`auth_invalid_token`, `auth_expired`) : il n'y a jamais de repli silencieux vers le scope public. `POST /token` crée un token rattaché au tenant de l'appelant.
+## Vérification
 
-Le token généré automatiquement est affiché dans les logs de démarrage : protège ces logs comme un secret.
+- Santé : GET http://127.0.0.1:8085/health
+- Swagger : http://127.0.0.1:8085/docs
+- Cibles Makefile : voir make help ; certaines opérations nécessitent Docker.
 
-## Surveillance et exploitation
-
-### Vérification de santé
-
-```bash
-curl -fsS http://127.0.0.1:8085/health
-```
-
-### Swagger / docs API
-
-```text
-http://127.0.0.1:8085/docs
-```
-
-### Logs
-
-```bash
-docker compose logs -f
-```
-
-ou
-
-```bash
-make logs
-```
-
-### Redémarrage
-
-```bash
-docker compose restart
-```
-
-ou
-
-```bash
-make restart
-```
-
-## Production légère : recommandations
-
-Pour un usage quasi-production, les recommandations suivantes sont pertinentes :
-
-- exposer le service derrière un reverse proxy (Nginx / Caddy)
-- utiliser un secret manager ou un environnement d'orchestration pour `API_TOKEN`
-- monter un volume persistant sur `ZONES_DIR`
-- limiter les accès réseau au service DNS administratif
-- activer les logs structurés et la collecte centralisée
-- utiliser un monitoring de santé avec alerting sur `/health`
-- ne pas laisser de token en clair dans un dépôt Git
-
-## Exemple de stack de production légère
-
-```yaml
-services:
-  squilladns:
-    image: ghcr.io/fte/squilladns:latest
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:8085:8085"
-    environment:
-      - API_ADDR=0.0.0.0:8085
-      - API_TOKEN=${API_TOKEN}
-      - ZONES_DIR=/data/zones
-    volumes:
-      - ./data/zones:/data/zones
-```
-
-## Exemples d'appels
-
-### Endpoint de santé
-
-```bash
-curl http://127.0.0.1:8085/health
-```
-
-### Génération d'un token
-
-```bash
-curl -X POST http://127.0.0.1:8085/token \
-  -H "Authorization: Bearer <token>"
-```
-
-### Synchronisation d'une zone
-
-```bash
-curl -X POST http://127.0.0.1:8085/sync \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <token>" \
-  -d '{
-    "records": [
-      {"type": "A", "name": "@", "value": "203.0.113.10"},
-      {"type": "TXT", "name": "@", "value": "v=spf1 include:_spf.example.com ~all"}
-    ]
-  }'
-```
-
-## Nettoyage
-
-Pour supprimer le service et ses ressources Docker locales :
-
-```bash
-make down
-```
-
-ou :
-
-```bash
-docker compose down
-```
-
-## Points d'amélioration recommandés
-
-- validation stricte des entrées DNS
-- persistance utilisateur / multi-tenant
-- gestion des ACL et de l'autorisation par zone
-- intégration avec un service BIND9 opéré via reload/restart
-- métriques Prometheus / OpenTelemetry
-- test automatisé de génération de fichier zone
-
-## Conclusion
-
-SquillaDNS est déjà un service exploitable comme base technique pour la gestion d'une zone DNS via API, mais il doit encore évoluer vers un modèle plus robuste pour le multi-tenancy, la validation et la production. L'installation est volontairement simple pour rendre le projet facile à tester et à déployer sans dépendre d'un écosystème lourd.
+En production, limite l’accès réseau à l’API, utilise un secret manager et
+monte des volumes persistants. Restreins CORS aux origines réellement utilisées.
