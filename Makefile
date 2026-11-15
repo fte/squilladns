@@ -16,8 +16,18 @@ IMAGE    := squilladns
 CONTAINER_NAME := squilladns
 PORT     := 8085
 
-# Token par défaut (surchargeable : make up API_TOKEN=montoken)
-API_TOKEN ?= change-me-apres-creation
+# Token racine (surchargeable : make up API_TOKEN=montoken).
+# Vide = un token est généré, écrit dans .state/tokens et affiché dans les logs.
+API_TOKEN ?=
+
+# Verbosité des logs (surchargeable : make up RUST_LOG=debug)
+RUST_LOG ?= info
+
+# Auth JWT (facultatif) : le front émet des JWT HS256 signés avec ce secret
+JWT_SECRET   ?=
+
+# Mode bac à sable : auth court-circuitée pour cet utilisateur (dev uniquement)
+SANDBOX_USER ?=
 
 # ---------------------------------------------------------------------------
 # Détection des CLIs au parse-time
@@ -118,11 +128,18 @@ up: _guard ## Lance le service en arrière-plan (build auto)
 	$(call print_runtime)
 ifeq ($(RUNTIME_EFFECTIVE),container)
 	container build -t $(IMAGE) .
+	@mkdir -p $(CURDIR)/.state
 	container run \
 	  --detach \
 	  --name $(CONTAINER_NAME) \
 	  --publish $(PORT):$(PORT) \
+	  --volume $(CURDIR)/zones:/app/zones \
+	  --volume $(CURDIR)/.state:/app/state \
+	  --env API_TOKEN_PATH=/app/state/tokens \
 	  --env API_TOKEN=$(API_TOKEN) \
+	  --env RUST_LOG=$(RUST_LOG) \
+	  --env JWT_SECRET=$(JWT_SECRET) \
+	  --env SANDBOX_USER=$(SANDBOX_USER) \
 	  $(IMAGE)
 	@printf '\033[1;32m✓ Container démarré : http://localhost:%s\033[0m\n' "$(PORT)"
 else

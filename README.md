@@ -25,7 +25,7 @@ Le nom vient de la squille, un crustacé rapide et très observateur, ce qui rap
 - Restaurer le fichier précédent si la validation finale échoue
 - Générer des fichiers `*.zone` destinés à être consommés par BIND9
 - Recharger une zone avec `rndc reload` quand `rndc` est disponible
-- Isoler les zones par scope : `public/` pour les appels anonymes, `user-<id>/` pour les appels authentifiés
+- Isoler les zones par scope : `public/` pour les appels anonymes, `tenants/<tenant>/` pour les appels authentifiés
 - Lister les zones du scope courant via `GET /zones`
 - Serial incrémental relu depuis le fichier de zone existant (`max(jour UTC, serial + 1)`)
 
@@ -51,14 +51,21 @@ Le SOA est généré automatiquement ; il ne fait pas partie des types acceptés
 
 ### Authentification et sécurité
 
-- Auth optionnelle : sans token, l'appelant est anonyme et travaille dans le scope `public`
-- Avec `Authorization: Bearer <token>`, les zones sont isolées par utilisateur (`private:<id>`)
-- Tokens acceptés : token interne (fichier `API_TOKEN_PATH`), ou token OAuth Google / GitHub / Microsoft vérifié via l'endpoint userinfo du provider
-- Mode sandbox pour le dev local : `SANDBOX_USER=alice` (aucun provider requis)
-- `POST /token` ajoute un token interne au fichier sans invalider les précédents
-- Conservation du token dans `API_TOKEN_PATH`, avec permissions Unix `0600`
+Deux mécanismes, aucun appel réseau : l'API ne contacte **jamais** un provider OAuth.
+
+- Auth optionnelle : sans header `Authorization`, l'appelant est anonyme et travaille dans le scope `public`
+- Avec `Authorization: Bearer <token>`, les zones sont isolées dans le tenant du porteur (`scope: "private"`)
+- **Token API** : `sqi_…`, stocké dans `API_TOKEN_PATH` ; les tokens créés par `POST /token` héritent du compte SSO appelant et partagent ses zones
+- **JWT HS256** : émis par le client après un SSO GitHub/Azure/Google. Claims requis : `sub`, `preferred_username`, `exp`, `aud` (défaut `squilladns`). Voir [AUTH.md](./AUTH.md)
+- Un credential présent mais invalide renvoie `401` en `problem+json` (`auth_invalid_token`, `auth_expired`, `auth_required`) — jamais de repli silencieux vers le scope public
+- L'API range les zones sous un identifiant interne lisible et stable, jamais renvoyé au client ; le client reçoit seulement le slug du login SSO
+- Mode sandbox pour le dev local : `SANDBOX_USER=alice` (auth court-circuitée, avertissement au démarrage)
+- `POST /token` crée un token rattaché au tenant de l'appelant, sans invalider les précédents
+- Conservation des tokens dans `API_TOKEN_PATH`, écriture atomique, permissions Unix `0600`
 - CORS configurable via `CORS_ALLOWED_ORIGINS` (ouvert par défaut, y compris `Origin: null` des fichiers locaux)
 - Documentation OpenAPI / Swagger incluse
+
+Les spécifications côté client (flux SSO, boutons, gestion des erreurs) sont dans **[AUTH.md](./AUTH.md)**.
 
 ### Déploiement et exploitation
 
@@ -104,12 +111,12 @@ Côté navigateur, `performance.getEntriesByType("resource")[i].serverTiming` ex
 |---------|--------|-------------|------|
 | GET | `/` | Redirection vers Swagger UI | — |
 | GET | `/health` | Vérifie l'état du service et le mode d'auth | — |
-| GET | `/auth/me` | Identité résolue de l'appelant | Optionnelle |
+| GET | `/auth/me` | Identité résolue de l'appelant (`slug`, `scope`) | Optionnelle |
 | GET | `/zones` | Liste les zones du scope courant | Optionnelle |
 | PUT | `/zones/{name}` | Crée (`201`) ou remplace (`200`) une zone | Optionnelle |
 | DELETE | `/zones/{name}` | Supprime une zone (`204` / `404`) | Optionnelle |
 | POST | `/sync` | Écrit une zone (body JSON) et/ou recharge (`?zone=`) | Optionnelle |
-| POST | `/token` | Ajoute un token interne au fichier | Requise |
+| POST | `/token` | Crée un token pour le tenant de l'appelant | Requise |
 | GET | `/docs` | Interface Swagger UI | — |
 
 Le body JSON des routes d'écriture est de la forme :
@@ -149,12 +156,16 @@ make logs
 | Variable | Défaut | Description |
 |----------|--------|-------------|
 | `API_ADDR` | `0.0.0.0:8085` | Adresse d'écoute du service |
-| `API_TOKEN` | vide | Token interne de bootstrap (réécrit au démarrage) |
-| `API_TOKEN_PATH` | `/app/.api-token` | Fichier de tokens internes (un par ligne, `0600`) |
-| `ZONES_DIR` | `zones/example.invalid` | Répertoire racine des zones (`<ZONES_DIR>/<scope>/<zone>/`) |
+| `API_TOKEN` | vide | Token racine. Vide : un token est généré au démarrage, écrit dans `API_TOKEN_PATH` et affiché une fois dans les logs |
+| `API_TOKEN_PATH` | `.state/tokens` | Fichier de tokens (`<tenant>\t<slug>\t<token>` par ligne, `0600`, migré automatiquement) |
+| `ZONES_DIR` | `zones/example.invalid` | Répertoire racine des zones (`<ZONES_DIR>/public/` ou `<ZONES_DIR>/tenants/<tenant>/`) |
 | `CORS_ALLOWED_ORIGINS` | `*` | Origines CORS autorisées, séparées par des virgules (`null` pour `file://`) |
-| `SANDBOX_USER` | vide | Mode dev : tout appelant devient cet utilisateur |
-| `AUTH_PROVIDER` | vide | Force la vérification sur un seul provider (`google`, `github`, `microsoft`) |
+| `JWT_SECRET` | vide | Secret HS256 (≥ 32 octets) partagé avec le front. Sans lui, les JWT sont refusés (`401`) |
+| `SANDBOX_USER` | vide | Mode dev : tout appelant devient cet utilisateur, auth court-circuitée |
+
+Les anciens répertoires tenant basés sur un haché sont déplacés automatiquement au
+premier appel JWT authentifié. Les répertoires `user-*` du schéma antérieur ne
+sont pas migrés automatiquement ; sauvegarde-les avant une migration manuelle.
 
 ## Exemple de consommation
 
@@ -192,11 +203,18 @@ curl -X DELETE http://127.0.0.1:8085/zones/example.invalid \
   -H "Authorization: Bearer <token>"
 ```
 
-### Générer un token interne
+### Générer un token API
 
 ```bash
+# Échanger le JWT SSO contre un token API et récupérer le slug client
 curl -X POST http://127.0.0.1:8085/token \
-  -H "Authorization: Bearer <token>"
+  -H "Authorization: Bearer <jwt-sso>"
+
+# {"created":true,"token":"sqi_…","slug":"alice"}
+
+# Lister les zones de ce compte avec le token API reçu
+curl http://127.0.0.1:8085/zones \
+  -H "Authorization: Bearer sqi_…"
 ```
 
 ## Structure du dépôt
@@ -215,6 +233,7 @@ curl -X POST http://127.0.0.1:8085/token \
 ├── Makefile
 ├── Cargo.toml
 ├── README.md
+├── AUTH.md
 ├── ROADMAP.md
 └── squilladns.jpeg
 ```

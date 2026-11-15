@@ -18,9 +18,11 @@ Ce document décrit les étapes de déploiement de SquillaDNS en environnement l
 | Variable | Défaut | Description |
 |----------|--------|-------------|
 | `API_ADDR` | `0.0.0.0:8085` | Adresse d'écoute du service |
-| `API_TOKEN` | vide | Token interne généré ou injecté pour sécuriser les endpoints sensibles |
-| `API_TOKEN_PATH` | `/app/.api-token` | Emplacement du fichier local contenant le token |
-| `ZONES_DIR` | `zones/example.invalid` | Répertoire racine des zones gérées par le service |
+| `API_TOKEN` | vide | Token racine. Vide : généré au démarrage, écrit dans `API_TOKEN_PATH` et affiché dans les logs |
+| `API_TOKEN_PATH` | `.state/tokens` | Fichier de tokens (`<tenant>\t<slug>\t<token>` par ligne, `0600`, anciens formats migrés) |
+| `ZONES_DIR` | `zones/example.invalid` | Répertoire racine des zones (`public/` et `tenants/<tenant>/`) |
+| `JWT_SECRET` | vide | Secret HS256 (≥ 32 octets) partagé avec le front ; sans lui, les JWT sont refusés |
+| `SANDBOX_USER` | vide | Mode dev : auth court-circuitée, tout appelant devient cet utilisateur |
 
 ## Modes d'installation
 
@@ -83,6 +85,8 @@ make ps
 
 Le service autorise un mode de sécurité avec token interne. Au démarrage, si `API_TOKEN` est absent et qu'aucun fichier de token n'est présent, SquillaDNS en crée un automatiquement et l'écrit sur `API_TOKEN_PATH` avec permissions `0600`.
 
+Le token de bootstrap (`API_TOKEN`) possède son propre tenant, stable même si le fichier de tokens est perdu. Les tokens créés via `POST /token` héritent du compte authentifié ; plusieurs tokens de ce compte retrouvent donc les mêmes zones.
+
 Exemple de lancement sécurisé :
 
 ```bash
@@ -92,10 +96,10 @@ export ZONES_DIR="./zones/example.invalid"
 docker compose up -d
 ```
 
-Le fichier `.api-token` est stocké en clair avec des permissions Unix restrictives (`0600`) ; il n'est pas chiffré. Protège le volume et ne publie jamais ce fichier :
+Le fichier de tokens (`API_TOKEN_PATH`, `.state/tokens` par défaut, `/app/state/tokens` dans le conteneur) est stocké en clair avec des permissions Unix restrictives (`0600`) ; il n'est pas chiffré. Protège le volume et ne publie jamais ce fichier :
 
 ```bash
-ls -l /app/.api-token
+ls -l .state/tokens
 ```
 
 ## Gestion des zones
@@ -122,11 +126,18 @@ Le fichier de zone est écrit au format BIND9 standard. Le SOA et, si nécessair
 
 ## Authentification
 
-Les routes `/zones`, `/sync` et `/token` requièrent un token Bearer partagé. Configure-le avec `API_TOKEN` ou utilise le token généré au démarrage et conservé dans `API_TOKEN_PATH`.
+L'authentification est **optionnelle** : sans header `Authorization`, l'appelant travaille dans le scope public. Avec un Bearer valide, il travaille dans son propre tenant (`scope: "private"`).
+
+Deux mécanismes acceptés :
+
+- **token API** (`sqi_…`), stocké dans `API_TOKEN_PATH` ;
+- **JWT HS256** émis par ton front après un SSO GitHub/Azure/Google (voir [AUTH.md](./AUTH.md)).
 
 ```bash
 curl -H "Authorization: Bearer <token>" http://127.0.0.1:8085/zones
 ```
+
+Un credential invalide renvoie `401` en `problem+json` (`auth_invalid_token`, `auth_expired`) : il n'y a jamais de repli silencieux vers le scope public. `POST /token` crée un token rattaché au tenant de l'appelant.
 
 Le token généré automatiquement est affiché dans les logs de démarrage : protège ces logs comme un secret.
 

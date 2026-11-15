@@ -3,7 +3,6 @@ mod validation;
 mod zone;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -23,7 +22,7 @@ use tower_http::cors::{Any, CorsLayer};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
-use auth::{resolve_user, AuthUser};
+use auth::{AuthError, AuthUser, JwtConfig, TokenStore};
 use validation::{validate_zone_payload, ProblemDetails, ValidationErrorCode};
 
 const VERSION: &str = "0.1.0";
@@ -44,12 +43,18 @@ const HEADER_TIMING_ALLOW_ORIGIN: HeaderName = HeaderName::from_static("timing-a
         version = "0.1.0",
         description = "DNS zone management API.\n\n\
             ## Authentification (optionnelle)\n\
-            Sans token : accès public, toutes les zones sont visibles et modifiables.\n\
-            Avec `Authorization: Bearer <token>` : les zones de l'utilisateur sont \
-            isolées et invisibles aux autres.\n\n\
-            Providers supportés : Google, GitHub, Microsoft.\n\
-            Mode sandbox : `SANDBOX_USER=alice` (dev local, pas de provider requis).\n\
-            Un token généré par `POST /token` est aussi accepté comme Bearer (provider `token`)."
+            Sans header `Authorization` : accès public, scope `public`.\n\
+            Avec `Authorization: Bearer <token>` : les zones du porteur sont isolées \
+            dans son propre tenant et invisibles aux autres.\n\n\
+            Deux mécanismes, aucun provider contacté par l'API :\n\
+            - **JWT HS256** émis par le client après un SSO (GitHub, Azure, Google…). \
+            Claims requis : `sub`, `preferred_username`, `exp`, `aud` (`squilladns` par défaut).\n\
+            `POST /token` échange ce JWT contre un token API et un slug public ; \
+            l'identifiant interne reste privé et stable pour retrouver les zones.\n\
+            - **Token API** `sqi_…` (fichier `API_TOKEN_PATH`), rattaché au tenant du porteur.\n\n\
+            Un credential présent mais invalide renvoie `401` (`problem+json`) : \
+            il n'y a jamais de repli silencieux vers le scope public.\n\
+            Mode sandbox : `SANDBOX_USER=alice` (dev local, auth court-circuitée)."
     ),
     paths(
         handle_health,
@@ -92,15 +97,19 @@ struct HealthResponse {
 #[derive(Serialize, ToSchema)]
 struct MeResponse {
     authenticated: bool,
-    id: Option<String>,
+    /// Slug public stable basé sur le login SSO.
+    slug: Option<String>,
     email: Option<String>,
+    /// `jwt`, `token` ou `sandbox`.
     provider: Option<String>,
+    /// `public` ou `private`.
+    scope: String,
 }
 
 #[derive(Serialize, ToSchema)]
 struct ZonesResponse {
     zones: Vec<String>,
-    /// "public" ou "private:<user_id>"
+    /// `public` (anonyme) ou `private` (authentifié)
     scope: String,
 }
 
@@ -108,6 +117,8 @@ struct ZonesResponse {
 struct TokenResponse {
     created: bool,
     token: String,
+    /// Slug public permettant au client de retrouver le compte et ses zones.
+    slug: String,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -153,9 +164,15 @@ pub struct ZonePayload {
 // État partagé
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
+/// État partagé.
+///
+/// `tokens` et `jwt` sont les deux seuls mécanismes d'auth : aucun provider
+/// n'est contacté, donc aucune I/O réseau dans `resolve_caller`.
 struct AppState {
-    token_path: PathBuf,
+    tokens: Mutex<TokenStore>,
+    jwt: Option<JwtConfig>,
+    /// Identité imposée par `SANDBOX_USER` (mode dev).
+    sandbox: Option<AuthUser>,
 }
 
 type SharedState = Arc<AppState>;
@@ -183,7 +200,12 @@ impl Timings {
 
         if let Ok(steps) = self.0.lock() {
             for (name, dur) in steps.iter() {
-                parts.push(format!("{};dur={:.1};desc=\"{}\"", name, dur, step_label(name)));
+                parts.push(format!(
+                    "{};dur={:.1};desc=\"{}\"",
+                    name,
+                    dur,
+                    step_label(name)
+                ));
             }
         }
 
@@ -209,17 +231,6 @@ fn step_label(step: &str) -> &str {
 fn timed<T>(timings: &Timings, step: &'static str, f: impl FnOnce() -> T) -> T {
     let start = Instant::now();
     let value = f();
-    timings.record(step, start.elapsed());
-    value
-}
-
-/// Variante asynchrone (résolution de token auprès d'un provider = I/O réseau).
-async fn timed_async<T, F>(timings: &Timings, step: &'static str, future: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    let start = Instant::now();
-    let value = future.await;
     timings.record(step, start.elapsed());
     value
 }
@@ -271,18 +282,30 @@ async fn server_timing(mut request: Request, next: Next) -> Response {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn auth_mode() -> String {
-    if let Ok(user) = std::env::var("SANDBOX_USER") {
-        if !user.is_empty() {
-            return format!("sandbox({})", user);
-        }
+/// Décrit les mécanismes actifs, pour `/health` et les logs de démarrage.
+fn auth_mode(state: &AppState) -> String {
+    if state.sandbox.is_some() {
+        return "sandbox".into();
     }
-    if let Ok(provider) = std::env::var("AUTH_PROVIDER") {
-        if !provider.is_empty() {
-            return format!("provider({})", provider);
-        }
+
+    let mut parts: Vec<&str> = Vec::new();
+    if state.jwt.is_some() {
+        parts.push("jwt");
     }
-    "public".into()
+    if !state
+        .tokens
+        .lock()
+        .map(|store| store.is_empty())
+        .unwrap_or(true)
+    {
+        parts.push("token");
+    }
+
+    if parts.is_empty() {
+        "public".into()
+    } else {
+        parts.join("+")
+    }
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -293,58 +316,89 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
         .map(|value| value.trim_start_matches("Bearer ").trim())
 }
 
-/// Résout l'appelant : token interne d'abord (pas d'appel réseau), puis
-/// sandbox / provider OAuth via `auth::resolve_user`. `None` = anonyme.
-async fn resolve_caller(headers: &HeaderMap, token_path: &Path) -> Option<AuthUser> {
-    if let Some(bearer) = bearer_token(headers) {
-        if !bearer.is_empty() && token_matches(token_path, bearer) {
-            return Some(AuthUser {
-                id: "api-token".into(),
-                email: None,
-                provider: "token".into(),
-            });
+/// Résout l'appelant, sans aucun appel réseau.
+///
+/// - sandbox configuré → toujours cet utilisateur ;
+/// - pas de header → anonyme (`Ok(None)`), scope `public` ;
+/// - token API connu → tenant du token ;
+/// - JWT valide → tenant dérivé du `sub` ;
+/// - credential présent mais invalide → `Err`, et **jamais** de repli anonyme
+///   (sinon un JWT expiré écrirait silencieusement dans le scope public).
+fn resolve_caller(headers: &HeaderMap, state: &AppState) -> Result<Option<AuthUser>, AuthError> {
+    if let Some(ref sandbox) = state.sandbox {
+        return Ok(Some(sandbox.clone()));
+    }
+
+    let Some(bearer) = bearer_token(headers) else {
+        return Ok(None);
+    };
+
+    if bearer.is_empty() {
+        return Err(AuthError::InvalidToken);
+    }
+
+    if let Some((tenant, slug)) = state
+        .tokens
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .resolve(bearer)
+    {
+        return Ok(Some(AuthUser {
+            email: None,
+            provider: "token".into(),
+            tenant,
+            legacy_tenant: None,
+            slug,
+        }));
+    }
+
+    if let Some(ref jwt) = state.jwt {
+        if jwt_shape(bearer) {
+            return jwt.verify(bearer).map(Some);
         }
     }
 
-    resolve_user(headers).await
+    Err(AuthError::InvalidToken)
 }
 
+/// Un JWT a exactement deux points ; évite de parser n'importe quoi.
+fn jwt_shape(token: &str) -> bool {
+    token.len() <= 8192 && token.bytes().filter(|byte| *byte == b'.').count() == 2
+}
+
+/// Étiquette de scope renvoyée au client. Volontairement sans identifiant :
+/// un tenant ne doit pas fuiter dans les réponses ni dans les logs.
 fn scope_of(user: &Option<AuthUser>) -> String {
     match user {
-        Some(user) => format!("private:{}", user.id),
+        Some(_) => "private".into(),
         None => "public".into(),
     }
 }
 
-/// Répertoire de travail du scope : `public/` ou `user-<id>/`.
-fn scope_dir(user: &Option<AuthUser>) -> String {
-    match user {
-        Some(user) => format!("user-{}", sanitize_id(&user.id)),
-        None => "public".into(),
-    }
-}
-
-fn sanitize_id(id: &str) -> String {
-    let cleaned: String = id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-
-    if cleaned.is_empty() {
-        "anonymous".into()
-    } else {
-        cleaned
-    }
-}
-
+/// Répertoire de travail : `public/` ou `tenants/<tenant>/`.
+///
+/// Le tenant est un hachage opaque : plus de collision entre deux identités
+/// (`a@b.com` et `a_b.com` tombaient auparavant dans le même `user-a_b.com`).
 fn zone_root(user: &Option<AuthUser>) -> PathBuf {
-    zone::zones_dir().join(scope_dir(user))
+    match user {
+        Some(user) => {
+            let root = zone::zones_dir();
+            let current = auth::tenant_dir(&root, &user.tenant);
+            if let Some(legacy) = user.legacy_tenant.as_deref() {
+                let previous = auth::tenant_dir(&root, legacy);
+                if !current.exists() && previous.exists() {
+                    if let Some(parent) = current.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    if let Err(error) = fs::rename(&previous, &current) {
+                        tracing::warn!("migration du dossier utilisateur impossible: {}", error);
+                    }
+                }
+            }
+            current
+        }
+        None => zone::zones_dir().join("public"),
+    }
 }
 
 fn list_zones(root: &Path) -> Result<Vec<String>, String> {
@@ -387,6 +441,22 @@ fn problem(
     (status, Json(body)).into_response()
 }
 
+/// Erreur d'authentification au format `problem+json`, avec un `type` stable
+/// (`https://squilladns.dev/errors/auth_*`) que le client peut traiter par code.
+fn auth_problem(error: AuthError, instance: &str) -> axum::response::Response {
+    let status = StatusCode::from_u16(error.status()).unwrap_or(StatusCode::UNAUTHORIZED);
+    let body = ProblemDetails::new(status.as_u16(), error.title())
+        .with_type(&format!("https://squilladns.dev/errors/{}", error.code()))
+        .with_detail(error.detail())
+        .with_instance(instance);
+
+    let mut response = (status, Json(body)).into_response();
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    response
+}
+
 fn validation_problem(
     errors: &[validation::ValidationError],
     instance: &str,
@@ -404,12 +474,9 @@ fn normalized_zone_name(raw: &str) -> Result<String, validation::ValidationError
 static NAMED_CHECKZONE: OnceLock<bool> = OnceLock::new();
 
 /// Valide le fichier de zone avec `named-checkzone` quand le binaire existe.
-fn check_zone_file(
-    zone_name: &str,
-    zone_file: &Path,
-) -> Result<(), validation::ValidationError> {
-    let available = *NAMED_CHECKZONE
-        .get_or_init(|| Command::new("named-checkzone").arg("-v").output().is_ok());
+fn check_zone_file(zone_name: &str, zone_file: &Path) -> Result<(), validation::ValidationError> {
+    let available =
+        *NAMED_CHECKZONE.get_or_init(|| Command::new("named-checkzone").arg("-v").output().is_ok());
 
     if !available {
         tracing::warn!("named-checkzone introuvable — validation du fichier de zone ignorée");
@@ -449,7 +516,11 @@ fn restore_zone(root: &Path, zone_name: &str, zone_file: &Path, previous: Option
     match previous {
         Some(content) => {
             if let Err(error) = fs::write(zone_file, content) {
-                tracing::error!("restauration de {} impossible: {}", zone_file.display(), error);
+                tracing::error!(
+                    "restauration de {} impossible: {}",
+                    zone_file.display(),
+                    error
+                );
             }
         }
         None => {
@@ -475,25 +546,27 @@ async fn handle_root() -> Redirect {
         (status = 200, description = "Service opérationnel", body = HealthResponse)
     )
 )]
-async fn handle_health() -> impl IntoResponse {
+async fn handle_health(State(state): State<SharedState>) -> impl IntoResponse {
     Json(HealthResponse {
         status: "ok".into(),
         version: VERSION.into(),
         zones_dir: zone::zones_dir().display().to_string(),
-        auth_mode: auth_mode(),
+        auth_mode: auth_mode(&state),
     })
 }
 
 /// Retourne l'identité de l'appelant courant
 ///
-/// - Anonyme si pas de token
-/// - Identifié si token valide (provider OAuth ou token interne)
+/// - Anonyme sans header `Authorization`
+/// - Identifié par un token API ou un JWT valide
 /// - Toujours identifié en mode sandbox
+/// - `401` si un credential est fourni mais invalide
 #[utoipa::path(
     get,
     path = "/auth/me",
     responses(
-        (status = 200, description = "Identité résolue (peut être anonyme)", body = MeResponse)
+        (status = 200, description = "Identité résolue (peut être anonyme)", body = MeResponse),
+        (status = 401, description = "Credential fourni mais invalide", body = ProblemDetails)
     ),
     security(("bearer_token" = []))
 )]
@@ -502,24 +575,27 @@ async fn handle_me(
     State(state): State<SharedState>,
     Extension(timings): Extension<Timings>,
 ) -> impl IntoResponse {
-    match timed_async(
-        &timings,
-        "auth",
-        resolve_caller(&headers, &state.token_path),
-    )
-    .await
-    {
+    let user = match timed(&timings, "auth", || resolve_caller(&headers, &state)) {
+        Ok(user) => user,
+        Err(error) => return auth_problem(error, "/auth/me"),
+    };
+
+    let scope = scope_of(&user);
+
+    match user {
         Some(user) => Json(MeResponse {
             authenticated: true,
-            id: Some(user.id),
+            slug: Some(user.slug),
             email: user.email,
             provider: Some(user.provider),
+            scope,
         }),
         None => Json(MeResponse {
             authenticated: false,
-            id: None,
+            slug: None,
             email: None,
             provider: None,
+            scope: scope_of(&None),
         }),
     }
     .into_response()
@@ -543,12 +619,10 @@ async fn handle_list_zones(
     State(state): State<SharedState>,
     Extension(timings): Extension<Timings>,
 ) -> impl IntoResponse {
-    let user = timed_async(
-        &timings,
-        "auth",
-        resolve_caller(&headers, &state.token_path),
-    )
-    .await;
+    let user = match timed(&timings, "auth", || resolve_caller(&headers, &state)) {
+        Ok(user) => user,
+        Err(error) => return auth_problem(error, "/zones"),
+    };
     let root = zone_root(&user);
 
     match timed(&timings, "list", || list_zones(&root)) {
@@ -591,12 +665,10 @@ async fn handle_put_zone(
     Json(payload): Json<ZonePayload>,
 ) -> impl IntoResponse {
     let instance = format!("/zones/{}", name);
-    let user = timed_async(
-        &timings,
-        "auth",
-        resolve_caller(&headers, &state.token_path),
-    )
-    .await;
+    let user = match timed(&timings, "auth", || resolve_caller(&headers, &state)) {
+        Ok(user) => user,
+        Err(error) => return auth_problem(error, &instance),
+    };
 
     let zone_name = match normalized_zone_name(&name) {
         Ok(zone_name) => zone_name,
@@ -673,12 +745,10 @@ async fn handle_delete_zone(
     UrlPath(name): UrlPath<String>,
 ) -> impl IntoResponse {
     let instance = format!("/zones/{}", name);
-    let user = timed_async(
-        &timings,
-        "auth",
-        resolve_caller(&headers, &state.token_path),
-    )
-    .await;
+    let user = match timed(&timings, "auth", || resolve_caller(&headers, &state)) {
+        Ok(user) => user,
+        Err(error) => return auth_problem(error, &instance),
+    };
 
     let zone_name = match normalized_zone_name(&name) {
         Ok(zone_name) => zone_name,
@@ -728,12 +798,10 @@ async fn handle_sync(
 ) -> impl IntoResponse {
     const INSTANCE: &str = "/sync";
 
-    let user = timed_async(
-        &timings,
-        "auth",
-        resolve_caller(&headers, &state.token_path),
-    )
-    .await;
+    let user = match timed(&timings, "auth", || resolve_caller(&headers, &state)) {
+        Ok(user) => user,
+        Err(error) => return auth_problem(error, INSTANCE),
+    };
 
     let payload = if body.is_empty() {
         None
@@ -817,9 +885,10 @@ async fn handle_sync(
     .into_response()
 }
 
-/// Génère ou renouvelle le token d'API interne
+/// Génère un token d'API rattaché au tenant de l'appelant
 ///
-/// Cet endpoint est protégé — nécessite un utilisateur authentifié.
+/// Le token créé ouvre le **même scope** que l'appelant (utile pour passer d'un
+/// JWT de front à un token de script), et n'invalide aucun token existant.
 #[utoipa::path(
     post,
     path = "/token",
@@ -827,7 +896,7 @@ async fn handle_sync(
     responses(
         (status = 201, description = "Token créé", body = TokenResponse),
         (status = 400, description = "Body invalide", body = ErrorResponse),
-        (status = 401, description = "Authentification requise", body = ErrorResponse),
+        (status = 401, description = "Authentification requise ou invalide", body = ProblemDetails),
     ),
     security(("bearer_token" = []))
 )]
@@ -837,14 +906,10 @@ async fn handle_token(
     Extension(timings): Extension<Timings>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let Some(user) = timed_async(
-        &timings,
-        "auth",
-        resolve_caller(&headers, &state.token_path),
-    )
-    .await
-    else {
-        return err(StatusCode::UNAUTHORIZED, "authentication required");
+    let user = match timed(&timings, "auth", || resolve_caller(&headers, &state)) {
+        Ok(Some(user)) => user,
+        Ok(None) => return auth_problem(AuthError::Required, "/token"),
+        Err(error) => return auth_problem(error, "/token"),
     };
 
     if !body.is_empty() {
@@ -853,7 +918,7 @@ async fn handle_token(
                 if let Some(name) = request.name {
                     tracing::info!(
                         "token requested by {} ({}) as '{}'",
-                        user.id,
+                        user.slug,
                         user.provider,
                         name
                     );
@@ -868,14 +933,28 @@ async fn handle_token(
         }
     }
 
-    let secret = timed(&timings, "token", generate_token);
-    append_token(&state.token_path, &secret);
+    let secret = timed(&timings, "token", auth::mint_token);
+    let stored = state
+        .tokens
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .add(&user.tenant, &user.slug, &secret);
+
+    if !stored {
+        return problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal Server Error",
+            "token store is not writable",
+            "/token",
+        );
+    }
 
     (
         StatusCode::CREATED,
         Json(TokenResponse {
             created: true,
             token: secret,
+            slug: user.slug,
         }),
     )
         .into_response()
@@ -922,84 +1001,47 @@ fn cors_layer() -> CorsLayer {
 }
 
 // ---------------------------------------------------------------------------
-// Token utils
-// ---------------------------------------------------------------------------
-
-fn generate_token() -> String {
-    use std::fmt::Write;
-    let bytes: [u8; 32] = std::array::from_fn(|_| rand::random::<u8>());
-    bytes.iter().fold(String::with_capacity(64), |mut s, b| {
-        write!(s, "{:02x}", b).ok();
-        s
-    })
-}
-
-/// Écrit le token de bootstrap (API_TOKEN) et applique les permissions 0600.
-fn write_token(path: &Path, secret: &str) {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).unwrap_or_else(|e| eprintln!("token dir: {}", e));
-    }
-    fs::write(path, format!("{}\n", secret.trim()))
-        .unwrap_or_else(|e| eprintln!("token write: {}", e));
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .unwrap_or_else(|e| eprintln!("token chmod: {}", e));
-}
-
-/// Ajoute un token sans invalider les précédents (un token par ligne).
-fn append_token(path: &Path, secret: &str) {
-    use std::io::Write;
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).unwrap_or_else(|e| eprintln!("token dir: {}", e));
-    }
-
-    let result = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut file| {
-            file.write_all(format!("{}\n", secret.trim()).as_bytes())?;
-            file.flush()
-        });
-
-    if let Err(error) = result {
-        eprintln!("token append: {}", error);
-    }
-
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-}
-
-/// Vrai si le bearer correspond à une ligne du fichier de tokens.
-fn token_matches(path: &Path, bearer: &str) -> bool {
-    let content = fs::read_to_string(path).unwrap_or_default();
-    content
-        .lines()
-        .map(str::trim)
-        .any(|line| !line.is_empty() && line == bearer)
-}
-
-// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt::init();
+    // `tracing-subscriber` est compilé avec `env-filter` : sans RUST_LOG,
+    // `fmt::init()` installait un filtre vide et n'affichait plus rien.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let token_env = std::env::var("API_TOKEN").unwrap_or_default();
     let token_path = PathBuf::from(
-        std::env::var("API_TOKEN_PATH").unwrap_or_else(|_| "/app/.api-token".to_string()),
+        std::env::var("API_TOKEN_PATH").unwrap_or_else(|_| ".state/tokens".to_string()),
     );
 
-    if !token_env.is_empty() {
-        write_token(&token_path, &token_env);
-    } else if !token_path.exists() {
-        let secret = generate_token();
-        tracing::warn!("no API_TOKEN set — generated token: {}", secret);
-        write_token(&token_path, &secret);
+    // Le token bootstrap a son propre tenant ; les tokens /token héritent du porteur.
+    let tokens = TokenStore::load(token_path, &token_env);
+
+    // JWT : configuration optionnelle, mais refusée au démarrage si invalide.
+    let jwt = match JwtConfig::from_env() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("auth config: {}", error);
+            std::process::exit(1);
+        }
+    };
+
+    let sandbox = auth::sandbox_user();
+    if let Some(ref sandbox) = sandbox {
+        tracing::warn!(
+            "sandbox mode — toute authentification est court-circuitée, utilisateur: {}",
+            sandbox.slug
+        );
     }
 
-    let state = Arc::new(AppState { token_path });
+    let state = Arc::new(AppState {
+        tokens: Mutex::new(tokens),
+        jwt,
+        sandbox,
+    });
 
     let app = Router::new()
         .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", ApiDoc::openapi()))
@@ -1015,7 +1057,7 @@ async fn main() {
         .route("/token", post(handle_token))
         .layer(middleware::from_fn(server_timing))
         .layer(cors_layer())
-        .with_state(state);
+        .with_state(Arc::clone(&state));
 
     let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8085".to_string());
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -1029,7 +1071,7 @@ async fn main() {
         "squilladns {} on {} — mode: {} — docs: http://{}/docs",
         VERSION,
         addr,
-        auth_mode(),
+        auth_mode(&state),
         addr
     );
 

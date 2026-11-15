@@ -1,5 +1,8 @@
 /target
 .api-token
+/.state
 *.log
 .DS_Store
 .env
+/zones/example.invalid/tenants/
+/zones/example.invalid/public/

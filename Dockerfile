@@ -30,5 +30,4 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=builder /app/target/release/squilladns .
 EXPOSE 8085
-ENV API_TOKEN=change-me-apres-creation
 CMD ["./squilladns"]

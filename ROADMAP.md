@@ -14,7 +14,7 @@ Implémenté :
 - Génération de fichiers de zone BIND9
 - Support de plusieurs types d'enregistrements
 - Calcul de serial BIND9
-- Authentification Bearer par token partagé (`API_TOKEN` / `API_TOKEN_PATH`)
+- Authentification Bearer sans appel réseau : tokens API (`API_TOKEN` / `API_TOKEN_PATH`, un tenant par token) et JWT HS256 émis par le client après SSO. Voir [AUTH.md](./AUTH.md)
 - Validation des payloads DNS et contrôle final des fichiers avec `named-checkzone`
 - Documentation OpenAPI / Swagger
 - Conteneurisation Docker / Docker Compose
@@ -50,8 +50,8 @@ Objectif : faire passer l'API d'un prototype de génération de fichiers à un s
 
 À livrer :
 
-- stockage des zones par namespace public / utilisateur
-- isolation des données entre comptes
+- stockage des zones par namespace (`public/`, `tenants/<tenant>/`) — fait
+- isolation des données entre comptes (tenants opaques, plus de collision d'identifiants) — fait
 - récupération/lecture des zones existantes
 - gestion de fichiers de zone dans un arborescence durable
 - validation des appels et des payloads

@@ -9,10 +9,15 @@ services:
     ports:
       - "8085:8085"
     environment:
-      - API_TOKEN=${API_TOKEN:-change-me-apres-creation}
+      - API_TOKEN=${API_TOKEN:-}
+      - API_TOKEN_PATH=/app/state/tokens
+      - RUST_LOG=${RUST_LOG:-info}
+      - JWT_SECRET=${JWT_SECRET:-}
+      - SANDBOX_USER=${SANDBOX_USER:-}
     volumes:
       # Persister les zones localement si besoin
-      - ./zones:/app/zones:ro
+      - ./zones:/app/zones
+      - ./.state:/app/state
     restart: unless-stopped
     networks:
       - dns-net

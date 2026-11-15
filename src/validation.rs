@@ -6,8 +6,8 @@ use thiserror::Error;
 /// RFC 7807 Problem Details error
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct ProblemDetails {
-    /// A URI reference that identifies the problem type
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// A URI reference that identifies the problem type (RFC 9457 `type`)
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub type_uri: Option<String>,
     /// A short, human-readable summary of the problem type
     pub title: String,
