@@ -11,6 +11,8 @@
 #   make up RUNTIME=container
 # =============================================================================
 
+-include .env
+
 RUNTIME  ?= auto
 IMAGE    := squilladns
 CONTAINER_NAME := squilladns
@@ -25,6 +27,8 @@ RUST_LOG ?= info
 
 # Auth JWT (facultatif) : le front émet des JWT HS256 signés avec ce secret
 JWT_SECRET   ?=
+JWT_ED25519_PUBLIC_KEY ?=
+BFF_API_AUDIENCE ?= squilladns
 
 # Mode bac à sable : auth court-circuitée pour cet utilisateur (dev uniquement)
 SANDBOX_USER ?=
@@ -139,6 +143,8 @@ ifeq ($(RUNTIME_EFFECTIVE),container)
 	  --env API_TOKEN=$(API_TOKEN) \
 	  --env RUST_LOG=$(RUST_LOG) \
 	  --env JWT_SECRET=$(JWT_SECRET) \
+	  --env JWT_ED25519_PUBLIC_KEY=$(JWT_ED25519_PUBLIC_KEY) \
+	  --env BFF_API_AUDIENCE=$(BFF_API_AUDIENCE) \
 	  --env SANDBOX_USER=$(SANDBOX_USER) \
 	  $(IMAGE)
 	@printf '\033[1;32m✓ Container démarré : http://localhost:%s\033[0m\n' "$(PORT)"

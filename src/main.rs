@@ -258,9 +258,33 @@ async fn server_timing(mut request: Request, next: Next) -> Response {
     let timings = Timings::default();
     request.extensions_mut().insert(timings.clone());
     let request_id = request_id(request.headers());
+    let method = request.method().to_string();
+    let path = request.uri().path().to_string();
+    let bearer = bearer_token(request.headers());
+    let jwt = bearer.and_then(auth::jwt_log_fields);
+    let auth_kind = match bearer {
+        None => "anonymous",
+        Some(token) if token.starts_with("sqi_") => "api_token",
+        Some(_) if jwt.is_some() => "jwt",
+        Some(_) => "unknown_bearer",
+    };
 
     let mut response = next.run(request).await;
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+    tracing::info!(
+        target: "squilladns::access",
+        request_id = %request_id, method = %method, path = %path,
+        status = response.status().as_u16(), duration_ms = total_ms,
+        auth_kind, jwt_claims_unverified = jwt.is_some(),
+        jwt_alg = ?jwt.as_ref().and_then(|j| j.alg.as_deref()),
+        jwt_kid = ?jwt.as_ref().and_then(|j| j.kid.as_deref()),
+        jwt_iss = ?jwt.as_ref().and_then(|j| j.iss.as_deref()),
+        jwt_sub = ?jwt.as_ref().and_then(|j| j.sub.as_deref()),
+        jwt_aud = ?jwt.as_ref().and_then(|j| j.aud.as_deref()),
+        jwt_exp = ?jwt.as_ref().and_then(|j| j.exp),
+        jwt_preferred_username = ?jwt.as_ref().and_then(|j| j.preferred_username.as_deref()),
+        "http access"
+    );
 
     let headers = response.headers_mut();
 
