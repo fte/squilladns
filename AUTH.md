@@ -34,7 +34,7 @@ pour l’interface ; l’autorisation dépend du bearer, pas du slug.
 
 | Claim | Requis | Contrat |
 |---|---|---|
-| iss | Oui pour EdDSA | `https://a.575.be/bff` |
+| iss | Oui | `https://a.575.be/bff` pour EdDSA ; issuer stable explicite pour HS256 |
 | sub | Oui | Identifiant stable du compte chez ce fournisseur, 1–128 caractères |
 | preferred_username | Oui | Login lisible, normalisé en slug |
 | aud | Oui | Valeur de `BFF_API_AUDIENCE` (défaut `squilladns`) |
@@ -50,7 +50,7 @@ Configurer `JWT_ED25519_PUBLIC_KEY` avec la clé publique brute du BFF encodée
 en base64url. Elle doit correspondre à la clé privée active côté BFF. L’API
 accepte EdDSA uniquement avec le `kid` configuré ci-dessus. Pour l’ancien flux
 HS256, `JWT_SECRET` doit faire au moins 32 octets et être identique côté BFF
-et API. L’API rejette les JWT incomplets et ne retombe jamais en mode anonyme
+et API ; les JWT HS256 doivent aussi porter un `iss` non vide. L’API rejette les JWT incomplets et ne retombe jamais en mode anonyme
 après une erreur d’auth. Le BFF est responsable de valider
 l’identité fournie par le fournisseur avant de signer.
 

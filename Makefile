@@ -25,7 +25,7 @@ API_TOKEN ?=
 # Verbosité des logs (surchargeable : make up RUST_LOG=debug)
 RUST_LOG ?= info
 
-# Auth JWT (facultatif) : le front émet des JWT HS256 signés avec ce secret
+# Auth JWT : clé publique Ed25519 du BFF, ou secret HS256 historique
 JWT_SECRET   ?=
 JWT_ED25519_PUBLIC_KEY ?=
 BFF_API_AUDIENCE ?= squilladns

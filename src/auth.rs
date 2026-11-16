@@ -313,14 +313,18 @@ impl JwtConfig {
             return Err(AuthError::InvalidToken);
         }
 
-        let issuer = claims.iss.as_deref().unwrap_or("sso");
+        let issuer = claims
+            .iss
+            .as_deref()
+            .filter(|issuer| !issuer.trim().is_empty())
+            .ok_or(AuthError::InvalidToken)?;
         let slug = claims
             .preferred_username
             .as_deref()
             .and_then(public_slug)
             .ok_or(AuthError::InvalidToken)?;
         let tenant = internal_user_id(issuer, subject);
-        let legacy_tenant = tenant_id("jwt", claims.iss.as_deref().unwrap_or("-"), subject);
+        let legacy_tenant = tenant_id("jwt", issuer, subject);
         Ok(AuthUser {
             tenant,
             legacy_tenant: Some(legacy_tenant),
@@ -697,6 +701,7 @@ mod tests {
 
     fn valid_claims() -> serde_json::Value {
         serde_json::json!({
+            "iss": "sso",
             "sub": "gh-42",
             "preferred_username": "Alice",
             "aud": "squilladns",

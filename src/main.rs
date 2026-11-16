@@ -48,7 +48,7 @@ const HEADER_TIMING_ALLOW_ORIGIN: HeaderName = HeaderName::from_static("timing-a
             dans son propre tenant et invisibles aux autres.\n\n\
             Deux mécanismes, aucun provider contacté par l'API :\n\
             - **JWT HS256** émis par le client après un SSO (GitHub, Azure, Google…). \
-            Claims requis : `sub`, `preferred_username`, `exp`, `aud` (`squilladns` par défaut).\n\
+            Claims requis : `iss`, `sub`, `preferred_username`, `exp`, `aud` (`squilladns` par défaut).\n\
             `POST /token` échange ce JWT contre un token API et un slug public ; \
             l'identifiant interne reste privé et stable pour retrouver les zones.\n\
             - **Token API** `sqi_…` (fichier `API_TOKEN_PATH`), rattaché au tenant du porteur.\n\n\
@@ -253,7 +253,11 @@ fn request_id(headers: &HeaderMap) -> String {
 /// Middleware : mesure la durée totale et publie les en-têtes de timing.
 ///
 /// Il doit rester sous `CorsLayer` pour que les `expose_headers` s'appliquent.
-async fn server_timing(mut request: Request, next: Next) -> Response {
+async fn server_timing(
+    State(state): State<SharedState>,
+    mut request: Request,
+    next: Next,
+) -> Response {
     let start = Instant::now();
     let timings = Timings::default();
     request.extensions_mut().insert(timings.clone());
@@ -261,12 +265,26 @@ async fn server_timing(mut request: Request, next: Next) -> Response {
     let method = request.method().to_string();
     let path = request.uri().path().to_string();
     let bearer = bearer_token(request.headers());
-    let jwt = bearer.and_then(auth::jwt_log_fields);
-    let auth_kind = match bearer {
-        None => "anonymous",
-        Some(token) if token.starts_with("sqi_") => "api_token",
-        Some(_) if jwt.is_some() => "jwt",
-        Some(_) => "unknown_bearer",
+    // Verify before extracting identity claims for the access log. Never log
+    // attacker-controlled, unverified JWT payloads.
+    let resolved_user =
+        bearer.and_then(|_| resolve_caller(request.headers(), &state).ok().flatten());
+    let jwt = if resolved_user
+        .as_ref()
+        .is_some_and(|user| user.provider == "jwt")
+    {
+        bearer.and_then(auth::jwt_log_fields)
+    } else {
+        None
+    };
+    let auth_kind = match (bearer, resolved_user.as_ref()) {
+        (None, _) => "anonymous",
+        (Some(_), Some(user)) if user.provider == "sandbox" => "sandbox",
+        (Some(token), Some(user)) if token.starts_with("sqi_") && user.provider == "token" => {
+            "api_token"
+        }
+        (Some(_), Some(user)) if user.provider == "jwt" => "jwt",
+        (Some(_), _) => "invalid_bearer",
     };
 
     let mut response = next.run(request).await;
@@ -275,7 +293,7 @@ async fn server_timing(mut request: Request, next: Next) -> Response {
         target: "squilladns::access",
         request_id = %request_id, method = %method, path = %path,
         status = response.status().as_u16(), duration_ms = total_ms,
-        auth_kind, jwt_claims_unverified = jwt.is_some(),
+        auth_kind, jwt_claims_verified = jwt.is_some(),
         jwt_alg = ?jwt.as_ref().and_then(|j| j.alg.as_deref()),
         jwt_kid = ?jwt.as_ref().and_then(|j| j.kid.as_deref()),
         jwt_iss = ?jwt.as_ref().and_then(|j| j.iss.as_deref()),
@@ -1079,7 +1097,10 @@ async fn main() {
         )
         .route("/sync", post(handle_sync))
         .route("/token", post(handle_token))
-        .layer(middleware::from_fn(server_timing))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            server_timing,
+        ))
         .layer(cors_layer())
         .with_state(Arc::clone(&state));
 
