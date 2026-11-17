@@ -23,7 +23,7 @@ pour l’interface ; l’autorisation dépend du bearer, pas du slug.
 
 ~~~json
 {
-  "iss": "github",
+  "iss": "https://a.575.be/bff",
   "sub": "583231",
   "preferred_username": "octocat",
   "email": "octocat@example.com",
@@ -34,7 +34,7 @@ pour l’interface ; l’autorisation dépend du bearer, pas du slug.
 
 | Claim | Requis | Contrat |
 |---|---|---|
-| iss | Oui | `https://a.575.be/bff` pour EdDSA ; issuer stable explicite pour HS256 |
+| iss | Oui | `https://a.575.be/bff` pour EdDSA ; valeur stable explicite pour HS256 |
 | sub | Oui | Identifiant stable du compte chez ce fournisseur, 1–128 caractères |
 | preferred_username | Oui | Login lisible, normalisé en slug |
 | aud | Oui | Valeur de `BFF_API_AUDIENCE` (défaut `squilladns`) |
@@ -42,9 +42,10 @@ pour l’interface ; l’autorisation dépend du bearer, pas du slug.
 | email | Non | Donnée de profil renvoyée par /auth/me |
 
 Le BFF adapte les claims propres à chaque fournisseur à ce contrat commun.
-Exemples : ID numérique + login pour GitHub ; sub + nom d’utilisateur ou email
-normalisé pour Google ; subject stable + login pour tout autre SSO. L’API ne
-contient pas de code spécifique à un fournisseur.
+`iss` identifie l’émetteur du JWT ; `sub` identifie l’utilisateur chez le
+fournisseur. Pour EdDSA, l’émetteur doit être le BFF. Exemples : ID numérique +
+login pour GitHub ; sub + nom d’utilisateur ou email normalisé pour Google.
+L’API ne dépend pas du fournisseur.
 
 Configurer `JWT_ED25519_PUBLIC_KEY` avec la clé publique brute du BFF encodée
 en base64url. Elle doit correspondre à la clé privée active côté BFF. L’API

@@ -47,7 +47,7 @@ const HEADER_TIMING_ALLOW_ORIGIN: HeaderName = HeaderName::from_static("timing-a
             Avec `Authorization: Bearer <token>` : les zones du porteur sont isolées \
             dans son propre tenant et invisibles aux autres.\n\n\
             Deux mécanismes, aucun provider contacté par l'API :\n\
-            - **JWT HS256** émis par le client après un SSO (GitHub, Azure, Google…). \
+            - **JWT EdDSA** signé par le BFF (ou HS256 historique) après un SSO (GitHub, Azure, Google…). \
             Claims requis : `iss`, `sub`, `preferred_username`, `exp`, `aud` (`squilladns` par défaut).\n\
             `POST /token` échange ce JWT contre un token API et un slug public ; \
             l'identifiant interne reste privé et stable pour retrouver les zones.\n\
@@ -175,6 +175,11 @@ struct AppState {
     sandbox: Option<AuthUser>,
 }
 
+/// Résultat d'authentification calculé une seule fois par le middleware,
+/// partagé avec les handlers et les logs d'accès.
+#[derive(Clone)]
+struct CallerResolution(Result<Option<AuthUser>, AuthError>);
+
 type SharedState = Arc<AppState>;
 
 // ---------------------------------------------------------------------------
@@ -264,26 +269,29 @@ async fn server_timing(
     let request_id = request_id(request.headers());
     let method = request.method().to_string();
     let path = request.uri().path().to_string();
-    let bearer = bearer_token(request.headers());
-    // Verify before extracting identity claims for the access log. Never log
-    // attacker-controlled, unverified JWT payloads.
-    let resolved_user =
-        bearer.and_then(|_| resolve_caller(request.headers(), &state).ok().flatten());
+    let bearer = bearer_token(request.headers()).map(str::to_owned);
+    let caller = CallerResolution(timed(&timings, "auth", || {
+        resolve_caller(request.headers(), &state)
+    }));
+    request.extensions_mut().insert(caller.clone());
+    let resolved_user = caller.0.as_ref().ok().and_then(Option::as_ref);
+    // Claims are decoded only after the shared auth result verified this JWT.
     let jwt = if resolved_user
         .as_ref()
         .is_some_and(|user| user.provider == "jwt")
     {
-        bearer.and_then(auth::jwt_log_fields)
+        bearer.as_deref().and_then(auth::jwt_log_fields)
     } else {
         None
     };
-    let auth_kind = match (bearer, resolved_user.as_ref()) {
+    let auth_kind = match (bearer.as_deref(), &caller.0) {
+        (None, Ok(Some(user))) if user.provider == "sandbox" => "sandbox",
         (None, _) => "anonymous",
-        (Some(_), Some(user)) if user.provider == "sandbox" => "sandbox",
-        (Some(token), Some(user)) if token.starts_with("sqi_") && user.provider == "token" => {
+        (Some(_), Ok(Some(user))) if user.provider == "sandbox" => "sandbox",
+        (Some(token), Ok(Some(user))) if token.starts_with("sqi_") && user.provider == "token" => {
             "api_token"
         }
-        (Some(_), Some(user)) if user.provider == "jwt" => "jwt",
+        (Some(_), Ok(Some(user))) if user.provider == "jwt" => "jwt",
         (Some(_), _) => "invalid_bearer",
     };
 
@@ -612,12 +620,8 @@ async fn handle_health(State(state): State<SharedState>) -> impl IntoResponse {
     ),
     security(("bearer_token" = []))
 )]
-async fn handle_me(
-    headers: HeaderMap,
-    State(state): State<SharedState>,
-    Extension(timings): Extension<Timings>,
-) -> impl IntoResponse {
-    let user = match timed(&timings, "auth", || resolve_caller(&headers, &state)) {
+async fn handle_me(Extension(caller): Extension<CallerResolution>) -> impl IntoResponse {
+    let user = match caller.0 {
         Ok(user) => user,
         Err(error) => return auth_problem(error, "/auth/me"),
     };
@@ -657,11 +661,10 @@ async fn handle_me(
     security(("bearer_token" = []))
 )]
 async fn handle_list_zones(
-    headers: HeaderMap,
-    State(state): State<SharedState>,
+    Extension(caller): Extension<CallerResolution>,
     Extension(timings): Extension<Timings>,
 ) -> impl IntoResponse {
-    let user = match timed(&timings, "auth", || resolve_caller(&headers, &state)) {
+    let user = match caller.0 {
         Ok(user) => user,
         Err(error) => return auth_problem(error, "/zones"),
     };
@@ -700,14 +703,13 @@ async fn handle_list_zones(
     security(("bearer_token" = []))
 )]
 async fn handle_put_zone(
-    headers: HeaderMap,
-    State(state): State<SharedState>,
+    Extension(caller): Extension<CallerResolution>,
     Extension(timings): Extension<Timings>,
     UrlPath(name): UrlPath<String>,
     Json(payload): Json<ZonePayload>,
 ) -> impl IntoResponse {
     let instance = format!("/zones/{}", name);
-    let user = match timed(&timings, "auth", || resolve_caller(&headers, &state)) {
+    let user = match caller.0 {
         Ok(user) => user,
         Err(error) => return auth_problem(error, &instance),
     };
@@ -781,13 +783,12 @@ async fn handle_put_zone(
     security(("bearer_token" = []))
 )]
 async fn handle_delete_zone(
-    headers: HeaderMap,
-    State(state): State<SharedState>,
+    Extension(caller): Extension<CallerResolution>,
     Extension(timings): Extension<Timings>,
     UrlPath(name): UrlPath<String>,
 ) -> impl IntoResponse {
     let instance = format!("/zones/{}", name);
-    let user = match timed(&timings, "auth", || resolve_caller(&headers, &state)) {
+    let user = match caller.0 {
         Ok(user) => user,
         Err(error) => return auth_problem(error, &instance),
     };
@@ -832,15 +833,14 @@ async fn handle_delete_zone(
     security(("bearer_token" = []))
 )]
 async fn handle_sync(
-    headers: HeaderMap,
-    State(state): State<SharedState>,
+    Extension(caller): Extension<CallerResolution>,
     Extension(timings): Extension<Timings>,
     Query(query): Query<SyncQuery>,
     body: Bytes,
 ) -> impl IntoResponse {
     const INSTANCE: &str = "/sync";
 
-    let user = match timed(&timings, "auth", || resolve_caller(&headers, &state)) {
+    let user = match caller.0 {
         Ok(user) => user,
         Err(error) => return auth_problem(error, INSTANCE),
     };
@@ -943,12 +943,12 @@ async fn handle_sync(
     security(("bearer_token" = []))
 )]
 async fn handle_token(
-    headers: HeaderMap,
+    Extension(caller): Extension<CallerResolution>,
     State(state): State<SharedState>,
     Extension(timings): Extension<Timings>,
     body: Bytes,
 ) -> impl IntoResponse {
-    let user = match timed(&timings, "auth", || resolve_caller(&headers, &state)) {
+    let user = match caller.0 {
         Ok(Some(user)) => user,
         Ok(None) => return auth_problem(AuthError::Required, "/token"),
         Err(error) => return auth_problem(error, "/token"),
