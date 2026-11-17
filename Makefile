@@ -133,7 +133,7 @@ up: _guard ## Lance le service en arrière-plan (build auto)
 ifeq ($(RUNTIME_EFFECTIVE),container)
 	container build -t $(IMAGE) .
 	@mkdir -p $(CURDIR)/.state
-	container run \
+	@container run \
 	  --detach \
 	  --name $(CONTAINER_NAME) \
 	  --publish $(PORT):$(PORT) \

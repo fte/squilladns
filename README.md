@@ -17,7 +17,7 @@ API Rust pour gérer des zones BIND9 via HTTP. État du projet : MVP 0.1.x.
 - named-checkzone et rndc sont utilisés lorsqu’ils sont disponibles.
 - Écriture restaurée si la validation finale échoue.
 - Un bearer invalide renvoie 401 ; il ne bascule jamais vers le scope public.
-- JWT HS256 du BFF ou token API ; POST /token émet un token lié au même tenant.
+- JWT EdDSA du BFF (HS256 historique) ou token API ; POST /token émet un token lié au même tenant.
   Le client reçoit le slug, jamais l’identifiant interne.
 
 ## Routes
