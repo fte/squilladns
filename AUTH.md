@@ -3,8 +3,9 @@
 ## Modèle
 
 L’API ne contacte pas les fournisseurs SSO. Le BFF valide le retour OAuth/OIDC,
-normalise l’identité et signe un JWT HS256 avec JWT_SECRET. L’API vérifie la
-signature, exp, aud et les claims requis.
+normalise l’identité et signe un JWT EdDSA. L’API vérifie la signature Ed25519,
+le `kid` `bff-2026-01`, l’émetteur, exp, aud et les claims requis. HS256 reste
+disponible pour les intégrations historiques.
 
 Flux :
 
@@ -33,10 +34,10 @@ pour l’interface ; l’autorisation dépend du bearer, pas du slug.
 
 | Claim | Requis | Contrat |
 |---|---|---|
-| iss | Non | Identifiant du fournisseur ; à renseigner pour isoler plusieurs SSO |
+| iss | Oui | `https://a.575.be/bff` pour EdDSA ; issuer stable explicite pour HS256 |
 | sub | Oui | Identifiant stable du compte chez ce fournisseur, 1–128 caractères |
 | preferred_username | Oui | Login lisible, normalisé en slug |
-| aud | Oui | squilladns |
+| aud | Oui | Valeur de `BFF_API_AUDIENCE` (défaut `squilladns`) |
 | exp | Oui | Timestamp Unix ; tolérance d’horloge de 60 secondes |
 | email | Non | Donnée de profil renvoyée par /auth/me |
 
@@ -45,9 +46,12 @@ Exemples : ID numérique + login pour GitHub ; sub + nom d’utilisateur ou emai
 normalisé pour Google ; subject stable + login pour tout autre SSO. L’API ne
 contient pas de code spécifique à un fournisseur.
 
-JWT_SECRET doit faire au moins 32 octets et être identique côté BFF et API.
-L’API accepte uniquement HS256, rejette les JWT incomplets et ne retombe jamais
-en mode anonyme après une erreur d’auth. Le BFF est responsable de valider
+Configurer `JWT_ED25519_PUBLIC_KEY` avec la clé publique brute du BFF encodée
+en base64url. Elle doit correspondre à la clé privée active côté BFF. L’API
+accepte EdDSA uniquement avec le `kid` configuré ci-dessus. Pour l’ancien flux
+HS256, `JWT_SECRET` doit faire au moins 32 octets et être identique côté BFF
+et API ; les JWT HS256 doivent aussi porter un `iss` non vide. L’API rejette les JWT incomplets et ne retombe jamais en mode anonyme
+après une erreur d’auth. Le BFF est responsable de valider
 l’identité fournie par le fournisseur avant de signer.
 
 ## Échange et appels API

@@ -17,10 +17,12 @@ configure ; l’API ne remplace pas la déclaration des zones dans named.conf.
 | API_TOKEN | vide | Token bootstrap ; vide = génération au démarrage |
 | API_TOKEN_PATH | .state/tokens | Stockage local des tokens, permissions 0600 |
 | ZONES_DIR | zones/example.invalid | Racine des fichiers de zones |
-| JWT_SECRET | vide | Secret HS256 partagé avec le BFF, minimum 32 octets |
+| JWT_SECRET | vide | Secret HS256 historique, minimum 32 octets |
+| JWT_ED25519_PUBLIC_KEY | vide | Clé publique Ed25519 BFF en base64url (32 octets) ; prioritaire sur JWT_SECRET |
+| BFF_API_AUDIENCE | squilladns | Audience attendue dans le JWT signé par le BFF |
 | CORS_ALLOWED_ORIGINS | * | Origines séparées par des virgules ; null autorise file:// |
 | SANDBOX_USER | vide | Identité de développement, auth désactivée |
-| RUST_LOG | info | Filtre tracing |
+| RUST_LOG | info | Filtre tracing ; inclut les logs d'accès HTTP |
 
 Sans API_TOKEN, le secret généré est écrit dans API_TOKEN_PATH et affiché une
 fois dans les logs. Le fichier contient les credentials en clair ; protège le

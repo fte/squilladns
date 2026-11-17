@@ -188,26 +188,46 @@ pub fn sandbox_user() -> Option<AuthUser> {
 }
 
 // ---------------------------------------------------------------------------
-// JWT (HS256)
+// JWT (HS256 legacy, EdDSA BFF)
 // ---------------------------------------------------------------------------
 
 /// Valeurs figées : ce projet n'a qu'un émetteur et une seule API.
 /// Deux réglages de plus seraient deux occasions de se tromper.
-const JWT_AUDIENCE: &str = "squilladns";
+const DEFAULT_JWT_AUDIENCE: &str = "squilladns";
+const BFF_ISSUER: &str = "https://a.575.be/bff";
+const BFF_KID: &str = "bff-2026-01";
 const CLOCK_LEEWAY_SECS: i64 = 60;
 
 pub struct JwtConfig {
-    secret: Vec<u8>,
+    verifier: JwtVerifier,
+    audience: String,
+}
+
+enum JwtVerifier {
+    Hs256(Vec<u8>),
+    Ed25519([u8; 32]),
 }
 
 impl JwtConfig {
-    /// `Ok(None)` si `JWT_SECRET` n'est pas défini, `Err` si le secret est
-    /// inutilisable (trop court).
+    /// Clé publique Ed25519 prioritaire ; HS256 reste disponible pour compatibilité.
     pub fn from_env() -> Result<Option<Self>, String> {
+        let audience =
+            non_empty_env("BFF_API_AUDIENCE").unwrap_or_else(|| DEFAULT_JWT_AUDIENCE.to_string());
+        if let Some(public_key) = non_empty_env("JWT_ED25519_PUBLIC_KEY") {
+            let bytes = decode_b64(&public_key)
+                .ok_or_else(|| "JWT_ED25519_PUBLIC_KEY doit être en base64url".to_string())?;
+            let key: [u8; 32] = bytes.try_into().map_err(|_| {
+                "JWT_ED25519_PUBLIC_KEY doit contenir une clé Ed25519 brute de 32 octets"
+                    .to_string()
+            })?;
+            return Ok(Some(Self {
+                verifier: JwtVerifier::Ed25519(key),
+                audience,
+            }));
+        }
         let Some(secret) = non_empty_env("JWT_SECRET") else {
             return Ok(None);
         };
-
         if secret.len() < MIN_SECRET_LEN {
             return Err(format!(
                 "JWT_SECRET trop court ({} octets, minimum {})",
@@ -215,9 +235,9 @@ impl JwtConfig {
                 MIN_SECRET_LEN
             ));
         }
-
         Ok(Some(Self {
-            secret: secret.into_bytes(),
+            verifier: JwtVerifier::Hs256(secret.into_bytes()),
+            audience,
         }))
     }
 
@@ -233,9 +253,6 @@ impl JwtConfig {
         let header: JwtHeader = decode_json(header_b64).ok_or(AuthError::InvalidToken)?;
 
         // Épingle l'algorithme : jamais `none`, jamais de confusion HS/RS.
-        if header.alg != "HS256" {
-            return Err(AuthError::InvalidToken);
-        }
         if header
             .typ
             .as_deref()
@@ -245,13 +262,22 @@ impl JwtConfig {
         }
 
         let signature = decode_b64(signature_b64).ok_or(AuthError::InvalidToken)?;
-        let expected = hmac_sha256(
-            &self.secret,
-            format!("{}.{}", header_b64, claims_b64).as_bytes(),
-        );
-
-        if !ct_eq(&signature, &expected) {
-            return Err(AuthError::InvalidToken);
+        let signing_input = format!("{}.{}", header_b64, claims_b64);
+        match (&self.verifier, header.alg.as_str()) {
+            (JwtVerifier::Hs256(secret), "HS256") => {
+                let expected = hmac_sha256(secret, signing_input.as_bytes());
+                if !ct_eq(&signature, &expected) {
+                    return Err(AuthError::InvalidToken);
+                }
+            }
+            (JwtVerifier::Ed25519(public_key), "EdDSA")
+                if header.kid.as_deref() == Some(BFF_KID) =>
+            {
+                ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public_key)
+                    .verify(signing_input.as_bytes(), &signature)
+                    .map_err(|_| AuthError::InvalidToken)?;
+            }
+            _ => return Err(AuthError::InvalidToken),
         }
 
         let claims: JwtClaims = decode_json(claims_b64).ok_or(AuthError::InvalidToken)?;
@@ -269,7 +295,12 @@ impl JwtConfig {
             }
         }
 
-        if !audience_matches(claims.aud.as_ref(), JWT_AUDIENCE) {
+        if !audience_matches(claims.aud.as_ref(), &self.audience) {
+            return Err(AuthError::InvalidToken);
+        }
+        if matches!(&self.verifier, JwtVerifier::Ed25519(_))
+            && claims.iss.as_deref() != Some(BFF_ISSUER)
+        {
             return Err(AuthError::InvalidToken);
         }
         let subject = claims.sub.trim();
@@ -282,14 +313,18 @@ impl JwtConfig {
             return Err(AuthError::InvalidToken);
         }
 
-        let issuer = claims.iss.as_deref().unwrap_or("sso");
+        let issuer = claims
+            .iss
+            .as_deref()
+            .filter(|issuer| !issuer.trim().is_empty())
+            .ok_or(AuthError::InvalidToken)?;
         let slug = claims
             .preferred_username
             .as_deref()
             .and_then(public_slug)
             .ok_or(AuthError::InvalidToken)?;
         let tenant = internal_user_id(issuer, subject);
-        let legacy_tenant = tenant_id("jwt", claims.iss.as_deref().unwrap_or("-"), subject);
+        let legacy_tenant = tenant_id("jwt", issuer, subject);
         Ok(AuthUser {
             tenant,
             legacy_tenant: Some(legacy_tenant),
@@ -304,7 +339,61 @@ impl JwtConfig {
 struct JwtHeader {
     alg: String,
     #[serde(default)]
+    kid: Option<String>,
+    #[serde(default)]
     typ: Option<String>,
+}
+
+/// Claims décodés pour les logs d'accès ; non authentifiés jusqu'à validation de signature.
+#[derive(Debug, Default)]
+pub struct JwtLogFields {
+    pub alg: Option<String>,
+    pub kid: Option<String>,
+    pub iss: Option<String>,
+    pub sub: Option<String>,
+    pub aud: Option<String>,
+    pub exp: Option<i64>,
+    pub preferred_username: Option<String>,
+}
+
+pub fn jwt_log_fields(token: &str) -> Option<JwtLogFields> {
+    if token.len() > 8192 {
+        return None;
+    }
+    let mut parts = token.split('.');
+    let (header, claims) = (parts.next()?, parts.next()?);
+    if parts.next().is_none() || parts.next().is_some() {
+        return None;
+    }
+    let header: JwtHeader = decode_json(header)?;
+    let claims: JwtClaims = decode_json(claims)?;
+    let aud = match claims.aud.as_ref() {
+        None => None,
+        Some(serde_json::Value::String(s)) => Some(log_value(s)),
+        Some(serde_json::Value::Array(a)) => Some(
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+                .chars()
+                .take(256)
+                .collect(),
+        ),
+        _ => None,
+    };
+    Some(JwtLogFields {
+        alg: Some(log_value(&header.alg)),
+        kid: header.kid.as_deref().map(log_value),
+        iss: claims.iss.as_deref().map(log_value),
+        sub: Some(log_value(&claims.sub)),
+        aud,
+        exp: claims.exp,
+        preferred_username: claims.preferred_username.as_deref().map(log_value),
+    })
+}
+
+fn log_value(value: &str) -> String {
+    value.chars().take(256).collect()
 }
 
 #[derive(Deserialize)]
@@ -596,7 +685,8 @@ mod tests {
 
     fn config(secret: &[u8]) -> JwtConfig {
         JwtConfig {
-            secret: secret.to_vec(),
+            verifier: JwtVerifier::Hs256(secret.to_vec()),
+            audience: DEFAULT_JWT_AUDIENCE.to_string(),
         }
     }
 
@@ -611,6 +701,7 @@ mod tests {
 
     fn valid_claims() -> serde_json::Value {
         serde_json::json!({
+            "iss": "sso",
             "sub": "gh-42",
             "preferred_username": "Alice",
             "aud": "squilladns",
