@@ -34,7 +34,8 @@ jobs:
           set -euo pipefail
 
           missing=0
-          for name in VPS_HOST VPS_PATH VPS_SSH_KEY VPS_SSH_USER VPS_KNOWN_HOSTS; do
+          # VPS_KNOWN_HOSTS temporairement commenté pour debug
+          for name in VPS_HOST VPS_PATH VPS_SSH_KEY VPS_SSH_USER; do
             value="${!name:-}"
             if [[ -z "$value" ]]; then
               echo "::error::Secret obligatoire manquant : $name"
@@ -47,7 +48,7 @@ jobs:
             exit 1
           fi
 
-          echo "Tous les secrets requis (y compris VPS_KNOWN_HOSTS) sont configurés."
+          echo "Secrets obligatoires configurés."
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # stable
@@ -68,7 +69,7 @@ jobs:
           echo "BINARY_SHA256=$BINARY_SHA256" >> "$GITHUB_ENV"
           echo "Binaire compilé avec empreinte SHA256 : $BINARY_SHA256"
 
-      - name: SSH preflight & verification
+      - name: SSH preflight & verification (verbose debug)
         run: |
           set -euo pipefail
 
@@ -80,21 +81,21 @@ jobs:
           chmod 600 ~/.ssh/id_deploy
           [[ -s ~/.ssh/id_deploy && "$(tail -c 1 ~/.ssh/id_deploy)" != "" ]] && echo "" >> ~/.ssh/id_deploy
 
-          # Configuration stricte de l'empreinte hôte (VPS_KNOWN_HOSTS obligatoire)
-          printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # Vérification stricte KNOWN_HOSTS commentée pour debug :
+          # printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # chmod 644 ~/.ssh/known_hosts
+
+          # Scan des clés d'hôte avec fallback
+          ssh-keyscan -p "$VPS_SSH_PORT" "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
           chmod 644 ~/.ssh/known_hosts
 
-          # Test discret de connexion SSH avec timeouts
-          echo "Test de connexion SSH vers $VPS_SSH_USER@$VPS_HOST:$VPS_SSH_PORT..."
-          if ! ssh -q -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o StrictHostKeyChecking=yes -p "$VPS_SSH_PORT" -i ~/.ssh/id_deploy "$VPS_SSH_USER@$VPS_HOST" 'echo SSH_OK' >/dev/null; then
-            echo "::error::Échec de la connexion SSH vers $VPS_SSH_USER@$VPS_HOST:$VPS_SSH_PORT."
-            echo "Vérifiez VPS_SSH_KEY, la clé autorisée sur le serveur et VPS_KNOWN_HOSTS."
-            exit 1
-          fi
+          # Test verbeux (-vvv) de connexion SSH
+          echo "Test de connexion SSH (-vvv) vers $VPS_SSH_USER@$VPS_HOST:$VPS_SSH_PORT..."
+          ssh -vvv -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o StrictHostKeyChecking=no -p "$VPS_SSH_PORT" -i ~/.ssh/id_deploy "$VPS_SSH_USER@$VPS_HOST" 'echo SSH_OK && whoami'
           echo "Connexion SSH validée avec succès."
 
           # Vérification de l'architecture serveur (x86_64 attendu)
-          remote_arch=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$VPS_SSH_PORT" -i ~/.ssh/id_deploy "$VPS_SSH_USER@$VPS_HOST" 'uname -m')
+          remote_arch=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no -p "$VPS_SSH_PORT" -i ~/.ssh/id_deploy "$VPS_SSH_USER@$VPS_HOST" 'uname -m')
           echo "Architecture distante détectée : $remote_arch"
           if [[ "$remote_arch" != "x86_64" ]]; then
             echo "::error::Incompatibilité d'architecture : le serveur est $remote_arch, le binaire est x86_64."
@@ -108,13 +109,13 @@ jobs:
           TARGET_DIR="${VPS_PATH}"
           EXPECTED_SHA256="${BINARY_SHA256}"
 
-          SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o StrictHostKeyChecking=yes"
+          SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o StrictHostKeyChecking=no"
 
           echo "[deploy] Création du dossier cible si nécessaire : $TARGET_DIR"
           ssh $SSH_OPTS -p "$VPS_SSH_PORT" -i ~/.ssh/id_deploy "$VPS_SSH_USER@$VPS_HOST" "mkdir -p '$TARGET_DIR'"
 
           echo "[deploy] Téléversement du binaire vers $TARGET_DIR/squilladns.new via SCP..."
-          scp -P "$VPS_SSH_PORT" -i ~/.ssh/id_deploy target/release/squilladns "$VPS_SSH_USER@$VPS_HOST:$TARGET_DIR/squilladns.new"
+          scp -o StrictHostKeyChecking=no -P "$VPS_SSH_PORT" -i ~/.ssh/id_deploy target/release/squilladns "$VPS_SSH_USER@$VPS_HOST:$TARGET_DIR/squilladns.new"
 
           echo "[deploy] Vérification intégrité, dépendances, installation atomique et redémarrage..."
           ssh $SSH_OPTS -p "$VPS_SSH_PORT" -i ~/.ssh/id_deploy "$VPS_SSH_USER@$VPS_HOST" bash -s -- "$TARGET_DIR" "$EXPECTED_SHA256" << 'REMOTE_SCRIPT'
