@@ -98,8 +98,8 @@ endef
 
 help: ## Affiche cette aide
 	@printf '\n\033[1mSquillaDNS — Makefile\033[0m\n\n'
-	@grep -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) \
-	  | awk 'BEGIN {FS = ":.*## "}; {printf "  \033[1;33m%-10s\033[0m %s\n", $$1, $$2}'
+	@grep -h -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) \
+	  | awk 'BEGIN {FS = ":.*## "}; {printf "  \033[1;33m%-12s\033[0m %s\n", $$1, $$2}'
 	@printf '\n'
 	@printf '  Surcharge : make <cible> RUNTIME=docker|container  API_TOKEN=xxx\n\n'
 
