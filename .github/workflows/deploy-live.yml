@@ -23,6 +23,7 @@ jobs:
       VPS_PATH: ${{ secrets.VPS_PATH }}
       VPS_SSH_PORT: ${{ secrets.VPS_SSH_PORT || '5785' }}
       VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+      VPS_SSH_PASSPHRASE: ${{ secrets.VPS_SSH_PASSPHRASE }}
       VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
 
     steps:
@@ -77,25 +78,46 @@ jobs:
           chmod 700 ~/.ssh
 
           # Conserver les sauts de ligne et retirer les retours chariot CRLF du secret
-          printf '%s\n' "$VPS_SSH_KEY" | sed 's/\r$//' > ~/.ssh/id_deploy
+          printf '%s\n' "$VPS_SSH_KEY" | tr -d '\r' > ~/.ssh/id_deploy
           chmod 600 ~/.ssh/id_deploy
           [[ -s ~/.ssh/id_deploy && "$(tail -c 1 ~/.ssh/id_deploy)" != "" ]] && echo "" >> ~/.ssh/id_deploy
 
-          # Vérification stricte KNOWN_HOSTS commentée pour debug :
-          # printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
-          # chmod 644 ~/.ssh/known_hosts
+          # Démarrer ssh-agent et exporter son socket pour tous les steps suivants
+          eval $(ssh-agent -s)
+          echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+
+          # Charger la clé dans ssh-agent (prend en charge avec ou sans passphrase)
+          if [[ -n "${VPS_SSH_PASSPHRASE:-}" ]]; then
+            echo "Chargement de la clé SSH dans ssh-agent avec passphrase..."
+            printf '#!/bin/sh\necho "$VPS_SSH_PASSPHRASE"\n' > ~/.ssh/askpass.sh
+            chmod 700 ~/.ssh/askpass.sh
+            DISPLAY=dummy SSH_ASKPASS=~/.ssh/askpass.sh SSH_ASKPASS_REQUIRE=force ssh-add ~/.ssh/id_deploy </dev/null
+          else
+            echo "Tentative de chargement de la clé SSH sans passphrase..."
+            if ! ssh-add ~/.ssh/id_deploy </dev/null 2>/dev/null; then
+              echo "::error::Impossible de charger la clé privée ~/.ssh/id_deploy."
+              echo "Votre clé privée est très probablement protégée par un mot de passe (passphrase)."
+              echo "Solution 1 : Ajoutez le secret GitHub 'VPS_SSH_PASSPHRASE' contenant votre mot de passe."
+              echo "Solution 2 : Retirez la passphrase de votre clé avec : ssh-keygen -p -f ~/.ssh/id_ed25519"
+              exit 1
+            fi
+          fi
+
+          echo "Clé SSH chargée avec succès dans ssh-agent :"
+          ssh-add -l
 
           # Scan des clés d'hôte avec fallback
           ssh-keyscan -p "$VPS_SSH_PORT" "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
           chmod 644 ~/.ssh/known_hosts
 
-          # Test verbeux (-vvv) de connexion SSH
+          # Test verbeux (-vvv) de connexion SSH via l'agent
           echo "Test de connexion SSH (-vvv) vers $VPS_SSH_USER@$VPS_HOST:$VPS_SSH_PORT..."
-          ssh -vvv -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o StrictHostKeyChecking=no -p "$VPS_SSH_PORT" -i ~/.ssh/id_deploy "$VPS_SSH_USER@$VPS_HOST" 'echo SSH_OK && whoami'
+          ssh -vvv -o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o StrictHostKeyChecking=no -p "$VPS_SSH_PORT" "$VPS_SSH_USER@$VPS_HOST" 'echo SSH_OK && whoami'
           echo "Connexion SSH validée avec succès."
 
           # Vérification de l'architecture serveur (x86_64 attendu)
-          remote_arch=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no -p "$VPS_SSH_PORT" -i ~/.ssh/id_deploy "$VPS_SSH_USER@$VPS_HOST" 'uname -m')
+          remote_arch=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=no -p "$VPS_SSH_PORT" "$VPS_SSH_USER@$VPS_HOST" 'uname -m')
           echo "Architecture distante détectée : $remote_arch"
           if [[ "$remote_arch" != "x86_64" ]]; then
             echo "::error::Incompatibilité d'architecture : le serveur est $remote_arch, le binaire est x86_64."
@@ -112,13 +134,13 @@ jobs:
           SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=15 -o ServerAliveInterval=15 -o StrictHostKeyChecking=no"
 
           echo "[deploy] Création du dossier cible si nécessaire : $TARGET_DIR"
-          ssh $SSH_OPTS -p "$VPS_SSH_PORT" -i ~/.ssh/id_deploy "$VPS_SSH_USER@$VPS_HOST" "mkdir -p '$TARGET_DIR'"
+          ssh $SSH_OPTS -p "$VPS_SSH_PORT" "$VPS_SSH_USER@$VPS_HOST" "mkdir -p '$TARGET_DIR'"
 
           echo "[deploy] Téléversement du binaire vers $TARGET_DIR/squilladns.new via SCP..."
-          scp -o StrictHostKeyChecking=no -P "$VPS_SSH_PORT" -i ~/.ssh/id_deploy target/release/squilladns "$VPS_SSH_USER@$VPS_HOST:$TARGET_DIR/squilladns.new"
+          scp -o StrictHostKeyChecking=no -P "$VPS_SSH_PORT" target/release/squilladns "$VPS_SSH_USER@$VPS_HOST:$TARGET_DIR/squilladns.new"
 
           echo "[deploy] Vérification intégrité, dépendances, installation atomique et redémarrage..."
-          ssh $SSH_OPTS -p "$VPS_SSH_PORT" -i ~/.ssh/id_deploy "$VPS_SSH_USER@$VPS_HOST" bash -s -- "$TARGET_DIR" "$EXPECTED_SHA256" << 'REMOTE_SCRIPT'
+          ssh $SSH_OPTS -p "$VPS_SSH_PORT" "$VPS_SSH_USER@$VPS_HOST" bash -s -- "$TARGET_DIR" "$EXPECTED_SHA256" << 'REMOTE_SCRIPT'
           set -euo pipefail
           APP_DIR="$1"
           EXPECTED_SHA256="$2"
