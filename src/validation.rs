@@ -51,6 +51,7 @@ impl ProblemDetails {
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_extension(mut self, key: &str, value: serde_json::Value) -> Self {
         self.extensions.insert(key.to_string(), value);
         self
@@ -106,6 +107,7 @@ pub enum ValidationErrorCode {
 }
 
 impl ValidationErrorCode {
+    #[allow(dead_code)]
     pub fn title(&self) -> &'static str {
         match self {
             Self::InvalidZoneName => "Invalid Zone Name",
@@ -168,6 +170,7 @@ impl ValidationError {
         self
     }
 
+    #[allow(dead_code)]
     pub fn to_problem_details(&self, instance: Option<&str>) -> ProblemDetails {
         let mut ext = std::collections::HashMap::new();
         ext.insert(
