@@ -94,7 +94,7 @@ endef
 
 .DEFAULT_GOAL := help
 
-.PHONY: help runtime build up down restart logs ps clean fclean test test-list test-watch
+.PHONY: help runtime build build-bin binary up down restart logs ps clean fclean test test-list test-watch
 
 help: ## Affiche cette aide
 	@printf '\n\033[1mSquillaDNS — Makefile\033[0m\n\n'
@@ -117,6 +117,11 @@ runtime: ## Affiche le runtime détecté
 	fi
 
 # ── build ──────────────────────────────────────────────────────────────────
+
+build-bin: ## Compile le binaire release (cargo build --release)
+	cargo build --release
+
+binary: build-bin ## Alias pour build-bin
 
 build: _guard ## Construit l'image (sans démarrer)
 	$(call print_runtime)
