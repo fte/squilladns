@@ -1,9 +1,11 @@
 name: Deploy Live VPS
 
 on:
-  push:
-    branches:
-      - main
+  # Déclenché manuellement via l'onglet Actions -> Run workflow pendant la phase de test.
+  # Décommentez le bloc push ci-dessous pour automatiser le déploiement sur chaque commit sur main :
+  # push:
+  #   branches:
+  #     - main
   workflow_dispatch:
 
 # Sérialiser les déploiements : un dispatch manuel ou deux pushs simultanés
@@ -26,35 +28,23 @@ jobs:
           set -euo pipefail
 
           missing=0
-          for name in VPS_HOST VPS_PATH VPS_SSH_KEY; do
+          for name in VPS_HOST VPS_PATH VPS_SSH_KEY VPS_SSH_USER; do
             value="${!name:-}"
             if [[ -z "$value" ]]; then
-              echo "Missing required secret: $name"
+              echo "::error::Secret obligatoire manquant : $name"
               missing=1
             fi
           done
-
-          if [[ -z "${VPS_SSH_USER:-}" ]]; then
-            echo "Missing required secret: VPS_SSH_USER"
-            missing=1
-          fi
 
           if [[ "$missing" -ne 0 ]]; then
             exit 1
           fi
 
-          echo "Secrets presence: OK"
-          echo "Host length: ${#VPS_HOST}"
-          echo "Path length: ${#VPS_PATH}"
-          ssh_user="${VPS_SSH_USER:-}"
-          echo "Port value: ${VPS_SSH_PORT:-5785}"
-          echo "Selected user length: ${#ssh_user}"
-          echo "SSH key length: ${#VPS_SSH_KEY}"
+          echo "Secrets requis présents : OK"
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_SSH_USER: ${{ secrets.VPS_SSH_USER }}
           VPS_PATH: ${{ secrets.VPS_PATH }}
-          VPS_SSH_PORT: ${{ secrets.VPS_SSH_PORT }}
           VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
 
       - name: Install Rust toolchain
@@ -69,66 +59,71 @@ jobs:
           ls -lh target/release/squilladns
           file target/release/squilladns
 
-      - name: SSH preflight debug (fingerprint + auth test)
+      - name: SSH preflight & verification
         run: |
           set -euo pipefail
 
-          SSH_USER="${VPS_SSH_USER:-}"
+          SSH_USER="${VPS_SSH_USER}"
           SSH_PORT="${VPS_SSH_PORT:-5785}"
 
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
 
-          # Conserver les sauts de ligne, retirer les éventuels retours chariot CRLF du secret
+          # Conserver les sauts de ligne, retirer les retours chariot CRLF du secret
           printf '%s\n' "$VPS_SSH_KEY" | sed 's/\r$//' > ~/.ssh/id_deploy
           chmod 600 ~/.ssh/id_deploy
 
           # S'assurer d'un saut de ligne final si absent
           [[ -s ~/.ssh/id_deploy && "$(tail -c 1 ~/.ssh/id_deploy)" != "" ]] && echo "" >> ~/.ssh/id_deploy
 
-          echo "Private key header: $(head -n 1 ~/.ssh/id_deploy)"
-          echo "Private key footer: $(tail -n 1 ~/.ssh/id_deploy)"
-          ssh-keygen -lf ~/.ssh/id_deploy
-
-          ssh-keyscan -p "$SSH_PORT" "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          # Vérification de l'hôte : utiliser VPS_KNOWN_HOSTS si défini, sinon fallback averti
+          if [[ -n "${VPS_KNOWN_HOSTS:-}" ]]; then
+            printf '%s\n' "$VPS_KNOWN_HOSTS" > ~/.ssh/known_hosts
+            echo "Empreinte hôte connue configurée depuis VPS_KNOWN_HOSTS."
+          else
+            echo "::warning::VPS_KNOWN_HOSTS non configuré. Récupération dynamique via ssh-keyscan (non recommandé en production)."
+            ssh-keyscan -p "$SSH_PORT" "$VPS_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+          fi
           chmod 644 ~/.ssh/known_hosts
 
-          echo "Testing SSH authentication..."
-          set +e
-          ssh -vvv -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -p "$SSH_PORT" -i ~/.ssh/id_deploy "$SSH_USER@$VPS_HOST" 'echo SSH_OK && whoami'
-          rc=$?
-          set -e
+          # Test d'authentification SSH discret (sans log verbeux ni fuite de détails)
+          echo "Test de la connexion SSH vers $SSH_USER@$VPS_HOST:$SSH_PORT..."
+          if ! ssh -q -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -p "$SSH_PORT" -i ~/.ssh/id_deploy "$SSH_USER@$VPS_HOST" 'echo SSH_OK' >/dev/null; then
+            echo "::error::Échec de l'authentification SSH."
+            echo "Vérifiez : 1) Clé privée VPS_SSH_KEY, 2) Clé publique autorisée sur le VPS, 3) VPS_KNOWN_HOSTS."
+            exit 1
+          fi
+          echo "Connexion SSH validée avec succès."
 
-          if [[ "$rc" -ne 0 ]]; then
-            echo "SSH preflight failed with code $rc"
-            echo "Most likely causes:"
-            echo "1) Public key not present in ~/.ssh/authorized_keys for target user ($SSH_USER)"
-            echo "2) Wrong target user secret (VPS_SSH_USER=$SSH_USER)"
-            echo "3) Wrong SSH port (VPS_SSH_PORT=$SSH_PORT)"
-            echo "4) Private key in secret does not match the installed public key on the server"
-            exit "$rc"
+          # Vérification de l'architecture du serveur distant (doit être x86_64)
+          remote_arch=$(ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$SSH_PORT" -i ~/.ssh/id_deploy "$SSH_USER@$VPS_HOST" 'uname -m')
+          echo "Architecture distante détectée : $remote_arch"
+          if [[ "$remote_arch" != "x86_64" ]]; then
+            echo "::error::Incompatibilité d'architecture : le serveur est $remote_arch, le binaire compilé est x86_64."
+            exit 1
           fi
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_SSH_USER: ${{ secrets.VPS_SSH_USER }}
           VPS_SSH_PORT: ${{ secrets.VPS_SSH_PORT }}
           VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_KNOWN_HOSTS: ${{ secrets.VPS_KNOWN_HOSTS }}
 
-      - name: Copy binary to VPS and restart
+      - name: Deploy binary and restart service
         run: |
           set -euo pipefail
 
-          SSH_USER="${VPS_SSH_USER:-}"
+          SSH_USER="${VPS_SSH_USER}"
           SSH_PORT="${VPS_SSH_PORT:-5785}"
           TARGET_DIR="${VPS_PATH:-/home/gbp4dt5/zones/575.be/api.a/}"
 
-          echo "[deploy] Ensuring remote directory exists: $TARGET_DIR"
+          echo "[deploy] Création du dossier cible si nécessaire : $TARGET_DIR"
           ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$SSH_PORT" -i ~/.ssh/id_deploy "$SSH_USER@$VPS_HOST" "mkdir -p '$TARGET_DIR'"
 
-          echo "[deploy] Uploading binary to $TARGET_DIR/squilladns.new via SCP..."
+          echo "[deploy] Envoi du binaire vers $TARGET_DIR/squilladns.new via SCP..."
           scp -P "$SSH_PORT" -i ~/.ssh/id_deploy target/release/squilladns "$SSH_USER@$VPS_HOST:$TARGET_DIR/squilladns.new"
 
-          echo "[deploy] Activating binary and checking health on VPS..."
+          echo "[deploy] Activation du binaire et redémarrage du service sur le VPS..."
           ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -p "$SSH_PORT" -i ~/.ssh/id_deploy "$SSH_USER@$VPS_HOST" bash -s -- "$TARGET_DIR" << 'REMOTE_SCRIPT'
           set -euo pipefail
           APP_DIR="$1"
@@ -137,27 +132,36 @@ jobs:
           # Remplacement atomique du binaire
           chmod 755 squilladns.new
           mv squilladns.new squilladns
-          echo "[deploy] squilladns binary updated successfully in $APP_DIR"
+          echo "[deploy] Binaire squilladns mis à jour dans $APP_DIR"
 
-          # Script de relance dédié si présent
-          if [[ -f restart.sh ]]; then
-            echo "[deploy] Executing local restart.sh..."
-            chmod +x restart.sh
+          # Gestion stricte du redémarrage du service
+          restarted=0
+          if [[ -f ./restart.sh ]]; then
+            echo "[deploy] Exécution du script local ./restart.sh..."
+            chmod +x ./restart.sh
             ./restart.sh
-          # Redémarrage du service systemd si configuré
+            restarted=1
           elif command -v systemctl >/dev/null 2>&1; then
             if sudo -n systemctl is-active --quiet squilladns.service 2>/dev/null; then
-              echo "[deploy] Restarting squilladns.service via sudo systemctl..."
+              echo "[deploy] Redémarrage de squilladns.service (sudo systemctl)..."
               sudo -n systemctl restart squilladns.service
-              sudo -n systemctl status squilladns.service | sed -n '1,15p' || true
+              restarted=1
             elif systemctl --user is-active --quiet squilladns.service 2>/dev/null; then
-              echo "[deploy] Restarting squilladns.service via systemctl --user..."
+              echo "[deploy] Redémarrage de squilladns.service (systemctl --user)..."
               systemctl --user restart squilladns.service
-              systemctl --user status squilladns.service | sed -n '1,15p' || true
+              restarted=1
             fi
           fi
 
-          echo "[deploy] Checking API health..."
+          if [[ "$restarted" -ne 1 ]]; then
+            echo "ERREUR : Impossible de redémarrer le service."
+            echo "Aucun script ./restart.sh trouvé dans $APP_DIR et le service 'squilladns.service' n'est pas actif."
+            echo "Fournissez un script $APP_DIR/restart.sh ou démarrez squilladns.service au préalable."
+            exit 1
+          fi
+
+          # Contrôle de santé strict : échec du job si /health ne répond pas HTTP 200
+          echo "[deploy] Vérification de l'état de l'API sur http://127.0.0.1:8085/health..."
           ready=0
           for _ in {1..30}; do
             if curl -fsS http://127.0.0.1:8085/health >/dev/null 2>&1; then
@@ -168,13 +172,20 @@ jobs:
           done
 
           if [[ "$ready" -ne 1 ]]; then
-            echo "[deploy] WARNING: API did not answer HTTP 200 on http://127.0.0.1:8085/health within timeout"
-          else
-            echo "[deploy] API is ready and healthy (HTTP 200 on /health)"
+            echo "ERREUR : L'API n'a pas répondu HTTP 200 sur http://127.0.0.1:8085/health après 30 secondes."
+            if command -v systemctl >/dev/null 2>&1; then
+              echo "=== Statut du service systemd ==="
+              systemctl --user status squilladns.service 2>/dev/null || sudo -n systemctl status squilladns.service 2>/dev/null || true
+              echo "=== Dernières lignes de journalctl ==="
+              journalctl --user -u squilladns.service -n 30 --no-pager 2>/dev/null || sudo -n journalctl -u squilladns.service -n 30 --no-pager 2>/dev/null || true
+            fi
+            exit 1
           fi
+
+          echo "[deploy] API opérationnelle (HTTP 200 sur /health) !"
           REMOTE_SCRIPT
 
-          echo "[deploy] Deployment completed successfully!"
+          echo "[deploy] Déploiement terminé avec succès !"
         env:
           VPS_HOST: ${{ secrets.VPS_HOST }}
           VPS_SSH_USER: ${{ secrets.VPS_SSH_USER }}
