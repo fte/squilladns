@@ -6,3 +6,7 @@
 .env
 /zones/example.invalid/tenants/
 /zones/example.invalid/public/
+AGENTS.md
+agents.txt
+TODO.md
+SPEC-runtime-validation.md

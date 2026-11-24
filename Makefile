@@ -22,6 +22,13 @@ PORT     := 8085
 # Vide = un token est généré, écrit dans .state/tokens et affiché dans les logs.
 API_TOKEN ?=
 
+# Limites des requêtes et RR (surchargeables via make up MAX_RECORDS_PER_ZONE=...)
+MAX_REQUEST_BODY_BYTES ?= 1048576
+MAX_RECORDS_PER_ZONE ?= 10000
+MAX_RECORD_NAME_BYTES ?= 253
+MAX_RECORD_VALUE_BYTES ?= 4096
+MAX_PARALLEL_VALIDATIONS ?= 4
+
 # Verbosité des logs (surchargeable : make up RUST_LOG=debug)
 RUST_LOG ?= info
 
@@ -146,6 +153,11 @@ ifeq ($(RUNTIME_EFFECTIVE),container)
 	  --volume $(CURDIR)/.state:/app/state \
 	  --env API_TOKEN_PATH=/app/state/tokens \
 	  --env API_TOKEN=$(API_TOKEN) \
+	  --env MAX_REQUEST_BODY_BYTES=$(MAX_REQUEST_BODY_BYTES) \
+	  --env MAX_RECORDS_PER_ZONE=$(MAX_RECORDS_PER_ZONE) \
+	  --env MAX_RECORD_NAME_BYTES=$(MAX_RECORD_NAME_BYTES) \
+	  --env MAX_RECORD_VALUE_BYTES=$(MAX_RECORD_VALUE_BYTES) \
+	  --env MAX_PARALLEL_VALIDATIONS=$(MAX_PARALLEL_VALIDATIONS) \
 	  --env RUST_LOG=$(RUST_LOG) \
 	  --env JWT_SECRET=$(JWT_SECRET) \
 	  --env JWT_ED25519_PUBLIC_KEY=$(JWT_ED25519_PUBLIC_KEY) \
@@ -221,15 +233,31 @@ endif
 test: ## Lance tous les tests (cargo test)
 	cargo test -- --nocapture
 
-test-list: ## Liste tous les tests disponibles (dynamiquement depuis le code)
+test-list: ## Liste les tests unitaires et d'intégration disponibles
 	@printf '\nTests disponibles\n\n'
-	@cargo test -- --list 2>&1 | grep -E '^validation::tests::' | while IFS= read -r line; do \
-		name=$${line%%: test}; \
-		printf '  %s\n' "$$name"; \
-	done
+	@cargo test -- --list 2>&1 | awk '\
+	/Running (unittests|tests|doctests)/ { \
+	  target = $$0; sub(/^.*Running /, "", target); sub(/ \(.*/, "", target); \
+	  current = ++groups; group_names[current] = target; counts[current] = 0; next; \
+	} \
+	/: test$$/ { \
+	  name = $$0; sub(/: test$$/, "", name); \
+	  counts[current]++; tests[current, counts[current]] = name; \
+	} \
+	END { \
+	  for (g = 1; g <= groups; g++) if (counts[g] > 0) { \
+	    printf "  %s (%d)\n", group_names[g], counts[g]; \
+	    for (i = 1; i <= counts[g]; i++) printf "    %s\n", tests[g, i]; \
+	  } \
+	}'
 	@printf '\n'
 
-test-watch: ## Lance les tests en mode watch (nécessite cargo-watch)
+test-watch: ## Relance les tests à chaque changement (nécessite cargo-watch)
+	@if ! cargo watch --version >/dev/null 2>&1; then \
+		printf '\033[1;31m[erreur]\033[0m cargo-watch n’est pas installé.\n'; \
+		printf '  Installe-le avec : cargo install cargo-watch\n'; \
+		exit 127; \
+	fi
 	cargo watch -x test
 
 # ── dev ──────────────────────────────────────────────────────────────────────
