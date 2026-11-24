@@ -9,10 +9,9 @@ sans base de données.
 
 La spécification du runtime, des limites, de la validation RR et de la
 publication BIND est dans [SPEC-runtime-validation.md](SPEC-runtime-validation.md).
-Les limites d’entrée, la validation RR typée, les verrous par zone, le
-remplacement atomique et les quotas bornés I/O/CPU sont implémentés. La
-validation `named-checkzone` reste postérieure à l’écriture ; la publication
-après validation préalable est encore à faire.
+Les limites d’entrée, la validation RR typée, les verrous par zone, les quotas
+bornés I/O/CPU, et la validation temporaire avant publication sont implémentés.
+La gestion BIND multi-étape et la coalescence des reloads restent à faire.
 
 ## À faire
 
@@ -29,9 +28,9 @@ Ordre d’implémentation proposé ; les identifiants renvoient à
    protection contre l’injection et conflits CNAME. `named-checkzone` reste le
    contrôle final de cohérence avec BIND.
 3. **Intégrité des écritures** — `SPEC-IO-04` terminé : verrou par tenant/zone
-   partagé par PUT, sync et DELETE ; remplacement du fichier par renommage
-   atomique. À faire : valider le fichier temporaire avec `named-checkzone`
-   avant publication et définir complètement les échecs (`SPEC-WRITE-*`).
+   partagé par PUT, sync et DELETE ; remplacement atomique du fichier. `SPEC-WRITE-06..09`
+   terminées : vérification `named-checkzone` sur le temporaire avant publication,
+   nettoyage en cas d’échec et résultats de persistance/activation distincts.
 4. **Travail bloquant et quotas** — `SPEC-IO-01..06` et `SPEC-OBS-02`
    terminées. Les tests couvrent le rejet à saturation, la libération des
    quotas et la conservation des permis quand une requête est annulée.

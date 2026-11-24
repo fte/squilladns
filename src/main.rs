@@ -11,7 +11,7 @@ use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
 use axum::{
@@ -137,6 +137,11 @@ pub struct TokenRequest {
 struct SyncResponse {
     /// "created", "updated", "synced" ou "reloaded"
     status: String,
+    /// Le fichier de zone est publié sur disque.
+    persisted: bool,
+    /// Résultat du rechargement demandé ; absent si aucun reload n'a été demandé.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active: Option<bool>,
     zone: String,
     serial: String,
     scope: String,
@@ -624,18 +629,8 @@ fn normalized_zone_name(raw: &str) -> Result<String, validation::ValidationError
     validation::validate_zone_name(raw).map(|zone| zone.trim_end_matches('.').to_string())
 }
 
-static NAMED_CHECKZONE: OnceLock<bool> = OnceLock::new();
-
 /// Valide le fichier de zone avec `named-checkzone` quand le binaire existe.
 fn check_zone_file(zone_name: &str, zone_file: &Path) -> Result<(), validation::ValidationError> {
-    let available =
-        *NAMED_CHECKZONE.get_or_init(|| Command::new("named-checkzone").arg("-v").output().is_ok());
-
-    if !available {
-        tracing::warn!("named-checkzone introuvable — validation du fichier de zone ignorée");
-        return Ok(());
-    }
-
     validation::validate_zone_file_with_named_checkzone(zone_name, zone_file)
 }
 
@@ -661,50 +656,44 @@ fn rndc_reload(zone_name: &str) -> bool {
     }
 }
 
-/// Annule une écriture de zone refusée par `named-checkzone`.
-///
-/// Si la zone existait, l'ancien contenu est restauré ; sinon le répertoire
-/// fraîchement créé est supprimé pour ne pas laisser de fichier invalide.
-fn restore_zone(root: &Path, zone_name: &str, zone_file: &Path, previous: Option<String>) {
-    match previous {
-        Some(content) => {
-            if let Err(error) = fs::write(zone_file, content) {
-                tracing::error!(
-                    "restauration de {} impossible: {}",
-                    zone_file.display(),
-                    error
-                );
-            }
-        }
-        None => {
-            let _ = fs::remove_dir_all(root.join(zone_name));
-        }
-    }
-}
-
 enum ZoneWriteError {
     Io(String),
     Validation(validation::ValidationError),
 }
 
-/// Lecture, génération, validation BIND et rollback forment une seule unité
-/// de travail bloquante exécutée sous le quota I/O.
+/// La cible n'est remplacée qu'après validation du fichier temporaire. Le Drop
+/// du temporaire le nettoie automatiquement sur tout échec.
 fn write_zone_transaction(
     root: &Path,
     zone_name: &str,
     records: &[validation::ValidatedRecord],
 ) -> Result<(bool, i32), ZoneWriteError> {
-    let zone_file = zone::zone_file_path(root, zone_name);
-    let created = !zone_file.exists();
-    let previous = fs::read_to_string(&zone_file).ok();
-    let serial = zone::compute_serial(zone::read_serial(&zone_file));
-    let written =
-        zone::generate_zone_file(zone_name, records, serial, root).map_err(ZoneWriteError::Io)?;
+    write_zone_transaction_with(root, zone_name, records, check_zone_file)
+}
 
-    if let Err(error) = check_zone_file(zone_name, &written) {
-        restore_zone(root, zone_name, &zone_file, previous);
-        return Err(ZoneWriteError::Validation(error));
-    }
+fn write_zone_transaction_with(
+    root: &Path,
+    zone_name: &str,
+    records: &[validation::ValidatedRecord],
+    validate: impl FnOnce(&str, &Path) -> Result<(), validation::ValidationError>,
+) -> Result<(bool, i32), ZoneWriteError> {
+    let zone_file = zone::zone_file_path(root, zone_name);
+    let (created, existing_serial) = match fs::read_to_string(&zone_file) {
+        Ok(content) => (false, zone::serial_from_contents(&content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (true, None),
+        Err(error) => {
+            return Err(ZoneWriteError::Io(format!(
+                "failed to read current zone: {}",
+                error
+            )))
+        }
+    };
+    let serial = zone::compute_serial(existing_serial);
+    let contents = zone::render_zone_file(zone_name, records, serial);
+    let prepared =
+        zone::prepare_zone_file(zone_name, &contents, root).map_err(ZoneWriteError::Io)?;
+    validate(zone_name, prepared.path()).map_err(ZoneWriteError::Validation)?;
+    prepared.publish().map_err(ZoneWriteError::Io)?;
     Ok((created, serial))
 }
 
@@ -857,7 +846,7 @@ async fn handle_list_zones(
         (status = 200, description = "Zone mise à jour", body = SyncResponse),
         (status = 400, description = "Nom de zone invalide", body = ProblemDetails),
         (status = 422, description = "Zone invalide", body = ProblemDetails),
-        (status = 503, description = "Capacité de validation momentanément saturée", body = ProblemDetails),
+        (status = 503, description = "Capacité saturée ou validation BIND expirée", body = ProblemDetails),
         (status = 500, description = "Erreur interne", body = ProblemDetails),
     ),
     security(("bearer_token" = []))
@@ -956,6 +945,8 @@ async fn handle_put_zone(
         code,
         Json(SyncResponse {
             status: status.into(),
+            persisted: true,
+            active: None,
             zone: zone_name,
             serial: serial.to_string(),
             scope: scope_of(&user),
@@ -1053,7 +1044,7 @@ async fn handle_delete_zone(
         (status = 400, description = "Requête invalide", body = ErrorResponse),
         (status = 404, description = "Zone introuvable", body = ErrorResponse),
         (status = 422, description = "Zone invalide", body = ProblemDetails),
-        (status = 503, description = "Capacité de validation momentanément saturée", body = ProblemDetails),
+        (status = 503, description = "Capacité saturée ou validation BIND expirée", body = ProblemDetails),
         (status = 500, description = "Erreur interne", body = ProblemDetails),
     ),
     security(("bearer_token" = []))
@@ -1170,6 +1161,8 @@ async fn handle_sync(
 
     Json(SyncResponse {
         status: if reloaded { "reloaded" } else { "synced" }.into(),
+        persisted: true,
+        active: Some(reloaded),
         zone: zone_name,
         serial: serial.to_string(),
         scope: scope_of(&user),
@@ -1470,6 +1463,71 @@ mod tests {
             16,
             "un id avec espace est remplacé"
         );
+    }
+
+    #[test]
+    fn sync_response_separates_persistence_from_activation() {
+        let put_response = SyncResponse {
+            status: "created".into(),
+            persisted: true,
+            active: None,
+            zone: "example.test".into(),
+            serial: "1".into(),
+            scope: "public".into(),
+        };
+        let put_json = serde_json::to_value(put_response).unwrap();
+        assert_eq!(put_json["persisted"], true);
+        assert!(put_json.get("active").is_none());
+
+        let sync_response = SyncResponse {
+            status: "synced".into(),
+            persisted: true,
+            active: Some(false),
+            zone: "example.test".into(),
+            serial: "2".into(),
+            scope: "public".into(),
+        };
+        let sync_json = serde_json::to_value(sync_response).unwrap();
+        assert_eq!(sync_json["persisted"], true);
+        assert_eq!(sync_json["active"], false);
+    }
+
+    #[test]
+    fn rejected_temporary_zone_keeps_previous_file_and_cleans_candidate() {
+        let root =
+            std::env::temp_dir().join(format!("squilladns-write-reject-{}", std::process::id()));
+        let target = zone::zone_file_path(&root, "example.test");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "previous zone contents\n").unwrap();
+        let records = vec![validation::validate_record(&Record {
+            record_type: "A".into(),
+            name: "www".into(),
+            value: "192.0.2.10".into(),
+        })
+        .unwrap()];
+
+        let result =
+            write_zone_transaction_with(&root, "example.test", &records, |_zone, candidate| {
+                assert_ne!(candidate, target);
+                assert!(candidate.exists());
+                Err(validation::ValidationError::new(
+                    validation::ValidationErrorCode::ZoneValidationFailed,
+                    "test rejection",
+                ))
+            });
+
+        assert!(matches!(result, Err(ZoneWriteError::Validation(_))));
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "previous zone contents\n"
+        );
+        let remaining: Vec<_> = std::fs::read_dir(target.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(remaining, vec![target.file_name().unwrap()]);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

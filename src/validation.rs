@@ -2,9 +2,12 @@ use hickory_proto::rr::Name;
 use squilladns::request_limits::RequestLimits;
 use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
+use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 /// RFC 7807 Problem Details error
@@ -100,6 +103,8 @@ pub enum ValidationErrorCode {
     InvalidCaaRecord,
     /// Zone file failed named-checkzone validation
     ZoneValidationFailed,
+    /// named-checkzone exceeded its execution deadline
+    ZoneValidationTimeout,
     /// Record value contains invalid characters
     InvalidCharacters,
     /// Label too long (>63 chars) or name too long (>253 chars)
@@ -130,6 +135,7 @@ impl ValidationErrorCode {
             Self::InvalidSrvRecord => "Invalid SRV Record",
             Self::InvalidCaaRecord => "Invalid CAA Record",
             Self::ZoneValidationFailed => "Zone Validation Failed",
+            Self::ZoneValidationTimeout => "Zone Validation Timed Out",
             Self::InvalidCharacters => "Invalid Characters",
             Self::LabelTooLong => "Label Too Long",
             Self::EmptyLabel => "Empty Label",
@@ -145,6 +151,7 @@ impl ValidationErrorCode {
             Self::ConflictingRecords => 422,
             Self::UnsupportedRecordType => 400,
             Self::ZoneValidationFailed => 422,
+            Self::ZoneValidationTimeout => 503,
             _ => 400,
         }
     }
@@ -777,36 +784,82 @@ pub fn validate_zone_file_with_named_checkzone(
     zone_name: &str,
     zone_file_path: &Path,
 ) -> Result<(), ValidationError> {
-    let output = Command::new("named-checkzone")
-        .args([zone_name, zone_file_path.to_str().unwrap_or("")])
-        .output()
-        .map_err(|e| {
-            ValidationError::new(
-                ValidationErrorCode::ZoneValidationFailed,
-                format!("Failed to execute named-checkzone: {}", e),
-            )
-        })?;
+    const CHECKZONE_TIMEOUT: Duration = Duration::from_secs(5);
+    let mut command = Command::new("named-checkzone");
+    command.args([zone_name, zone_file_path.to_str().unwrap_or("")]);
 
-    if !output.status.success() {
-        // `named-checkzone` écrit parfois le diagnostic sur stdout, pas stderr.
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = format!("{} {}", stderr.trim(), stdout.trim());
-        let detail = detail.trim();
-        let detail = if detail.is_empty() {
-            "named-checkzone exited with an error"
-        } else {
-            detail
-        };
-        return Err(ValidationError::new(
+    match run_command_with_timeout(&mut command, CHECKZONE_TIMEOUT) {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(ValidationError::new(
             ValidationErrorCode::ZoneValidationFailed,
-            format!("named-checkzone validation failed: {}", detail),
+            format!("named-checkzone rejected the zone ({})", status),
         )
-        .with_field("zone_file")
-        .with_value(&zone_file_path.display().to_string()));
+        .with_field("zone")
+        .with_value(zone_name)),
+        Err(CommandFailure::Unavailable) => {
+            tracing::warn!("named-checkzone introuvable — validation du fichier de zone ignorée");
+            Ok(())
+        }
+        Err(CommandFailure::TimedOut) => Err(ValidationError::new(
+            ValidationErrorCode::ZoneValidationTimeout,
+            "named-checkzone timed out",
+        )
+        .with_field("zone")
+        .with_value(zone_name)),
+        Err(CommandFailure::Spawn) => Err(ValidationError::new(
+            ValidationErrorCode::ZoneValidationFailed,
+            "failed to start named-checkzone",
+        )
+        .with_field("zone")
+        .with_value(zone_name)),
     }
+}
 
-    Ok(())
+#[derive(Debug, PartialEq, Eq)]
+enum CommandFailure {
+    Unavailable,
+    TimedOut,
+    Spawn,
+}
+
+/// Attend un processus avec une échéance fixe et jette sa sortie : l'API ne
+/// capture ni ne met en mémoire les diagnostics potentiellement volumineux.
+fn run_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<ExitStatus, CommandFailure> {
+    let mut child = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                CommandFailure::Unavailable
+            } else {
+                CommandFailure::Spawn
+            }
+        })?;
+    wait_with_timeout(&mut child, timeout)
+}
+
+fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<ExitStatus, CommandFailure> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CommandFailure::TimedOut);
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(CommandFailure::Spawn);
+            }
+        }
+    }
 }
 
 /// Generates a Problem Details response for multiple validation errors
@@ -822,7 +875,12 @@ pub fn validation_errors_to_problem_details(
         serde_json::Value::Number(errors.len().into()),
     );
 
-    ProblemDetails::new(first.code.status_code(), "Validation Failed")
+    let title = if first.code.status_code() == 503 {
+        "Service Unavailable"
+    } else {
+        "Validation Failed"
+    };
+    ProblemDetails::new(first.code.status_code(), title)
         .with_detail(&format!("{} validation error(s)", errors.len()))
         .with_instance(instance.unwrap_or(""))
         .with_extensions(ext)
@@ -1108,5 +1166,59 @@ mod tests {
             ],
         };
         assert!(validate_zone_payload_with_limits(&valid_rrset, &limits).is_ok());
+    }
+
+    #[test]
+    fn bounded_process_wait_reports_success_and_failure() {
+        let mut success = Command::new("/bin/sh");
+        success.args(["-c", "exit 0"]);
+        assert!(
+            run_command_with_timeout(&mut success, Duration::from_secs(1))
+                .unwrap()
+                .success()
+        );
+
+        let mut failure = Command::new("/bin/sh");
+        failure.args(["-c", "exit 1"]);
+        assert!(
+            !run_command_with_timeout(&mut failure, Duration::from_secs(1))
+                .unwrap()
+                .success()
+        );
+    }
+
+    #[test]
+    fn bounded_process_wait_kills_a_timed_out_command() {
+        let mut sleeper = Command::new("/bin/sh");
+        sleeper.args(["-c", "exec sleep 2"]);
+        assert_eq!(
+            run_command_with_timeout(&mut sleeper, Duration::from_millis(30)),
+            Err(CommandFailure::TimedOut)
+        );
+    }
+
+    #[test]
+    fn named_checkzone_timeout_is_a_service_error() {
+        let error = ValidationError::new(
+            ValidationErrorCode::ZoneValidationTimeout,
+            "named-checkzone timed out",
+        );
+        let response = validation_errors_to_problem_details(&[error], Some("/zones/example.test"));
+        assert_eq!(response.status, 503);
+        assert_eq!(response.title, "Service Unavailable");
+    }
+
+    #[test]
+    fn checkzone_error_does_not_expose_temporary_file_path() {
+        let path = std::env::temp_dir().join(format!(
+            "squilladns-invalid-zone-{}.zone",
+            std::process::id()
+        ));
+        std::fs::write(&path, "this is not a zone file\n").unwrap();
+        if let Err(error) = validate_zone_file_with_named_checkzone("example.test", &path) {
+            assert!(!error.message.contains(&path.display().to_string()));
+            assert_eq!(error.value.as_deref(), Some("example.test"));
+        }
+        let _ = std::fs::remove_file(path);
     }
 }

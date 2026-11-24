@@ -33,7 +33,10 @@ pub fn zone_file_path(zone_dir: &Path, zone_name: &str) -> PathBuf {
 /// Lit le serial actuel d'un fichier de zone (champ 3 de la ligne SOA).
 pub fn read_serial(zone_file: &Path) -> Option<i32> {
     let content = std::fs::read_to_string(zone_file).ok()?;
+    serial_from_contents(&content)
+}
 
+pub fn serial_from_contents(content: &str) -> Option<i32> {
     for line in content.lines() {
         let tokens: Vec<&str> = line.split_whitespace().collect();
         if let Some(idx) = tokens
@@ -48,16 +51,8 @@ pub fn read_serial(zone_file: &Path) -> Option<i32> {
     None
 }
 
-/// Génère le contenu d'un fichier de zone BIND9.
-pub fn generate_zone_file(
-    zone_name: &str,
-    records: &[ValidatedRecord],
-    serial: i32,
-    zone_dir: &Path,
-) -> Result<PathBuf, String> {
-    let zone_path = zone_dir.join(zone_name);
-    std::fs::create_dir_all(&zone_path).map_err(|e| format!("failed to create zone dir: {}", e))?;
-
+/// Sérialise une zone BIND9 en mémoire depuis des RR déjà validés.
+pub fn render_zone_file(zone_name: &str, records: &[ValidatedRecord], serial: i32) -> String {
     let mut lines: Vec<String> = Vec::new();
 
     // SOA record
@@ -116,15 +111,51 @@ pub fn generate_zone_file(
         lines.push(format!("{} 3600 IN {}", owner, rdata));
     }
 
-    let zone_file_path = zone_path.join(format!("{}.zone", zone_name));
-    let contents = lines.join("\n") + "\n";
+    lines.join("\n") + "\n"
+}
+
+/// Fichier temporaire prêt pour validation, non publié tant que `publish` n'est
+/// pas appelé. Drop nettoie le temporaire en cas d'erreur ou d'annulation.
+pub struct PreparedZoneFile {
+    temp_path: PathBuf,
+    target_path: PathBuf,
+}
+
+impl PreparedZoneFile {
+    pub fn path(&self) -> &Path {
+        &self.temp_path
+    }
+
+    pub fn publish(self) -> Result<PathBuf, String> {
+        std::fs::rename(&self.temp_path, &self.target_path)
+            .map_err(|e| format!("failed to publish zone file: {}", e))?;
+        Ok(self.target_path.clone())
+    }
+}
+
+impl Drop for PreparedZoneFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.temp_path);
+    }
+}
+
+/// Écrit et synchronise le contenu temporaire dans le même répertoire que la
+/// cible. Aucun changement visible de zone n'a lieu avant `publish`.
+pub fn prepare_zone_file(
+    zone_name: &str,
+    contents: &str,
+    zone_dir: &Path,
+) -> Result<PreparedZoneFile, String> {
+    let zone_path = zone_dir.join(zone_name);
+    std::fs::create_dir_all(&zone_path).map_err(|e| format!("failed to create zone dir: {}", e))?;
+    let target_path = zone_path.join(format!("{}.zone", zone_name));
     let temp_path = zone_path.join(format!(
         ".{}.{}.{}.tmp",
         zone_name,
         std::process::id(),
         TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed)
     ));
-    let write_result = (|| {
+    let write_result: Result<(), String> = (|| {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -135,15 +166,31 @@ pub fn generate_zone_file(
             .map_err(|e| format!("failed to write temporary zone file: {}", e))?;
         file.sync_all()
             .map_err(|e| format!("failed to sync temporary zone file: {}", e))?;
-        std::fs::rename(&temp_path, &zone_file_path)
-            .map_err(|e| format!("failed to publish zone file: {}", e))
+        Ok(())
     })();
     if write_result.is_err() {
         let _ = std::fs::remove_file(&temp_path);
     }
     write_result?;
 
-    Ok(zone_file_path)
+    Ok(PreparedZoneFile {
+        temp_path,
+        target_path,
+    })
+}
+
+/// Génère et publie immédiatement une zone. Conservé pour les tests et outils
+/// internes ; les handlers utilisent `prepare_zone_file` puis valident avant
+/// publication.
+#[cfg(test)]
+pub fn generate_zone_file(
+    zone_name: &str,
+    records: &[ValidatedRecord],
+    serial: i32,
+    zone_dir: &Path,
+) -> Result<PathBuf, String> {
+    let contents = render_zone_file(zone_name, records, serial);
+    prepare_zone_file(zone_name, &contents, zone_dir)?.publish()
 }
 
 #[cfg(test)]
@@ -186,6 +233,44 @@ mod tests {
             content.contains("ns 3600 IN A 127.0.0.1"),
             "un A par défaut est requis pour que BIND charge la zone"
         );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prepared_zone_keeps_target_unchanged_until_publish() {
+        let dir = std::env::temp_dir().join(format!("squilladns-prepared-{}", std::process::id()));
+        let target = zone_file_path(&dir, "alpha.test");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "old zone\n").unwrap();
+
+        let prepared = prepare_zone_file("alpha.test", "new zone\n", &dir).unwrap();
+        let temporary = prepared.path().to_path_buf();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old zone\n");
+        assert!(temporary.exists());
+
+        prepared.publish().unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new zone\n");
+        assert!(!temporary.exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dropping_unpublished_zone_removes_temp_and_keeps_old_target() {
+        let dir = std::env::temp_dir().join(format!("squilladns-discard-{}", std::process::id()));
+        let target = zone_file_path(&dir, "alpha.test");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "old zone\n").unwrap();
+
+        let temporary;
+        {
+            let prepared = prepare_zone_file("alpha.test", "invalid candidate\n", &dir).unwrap();
+            temporary = prepared.path().to_path_buf();
+            assert!(temporary.exists());
+        }
+        assert!(!temporary.exists());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old zone\n");
 
         let _ = std::fs::remove_dir_all(dir);
     }
