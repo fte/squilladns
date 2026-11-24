@@ -3,15 +3,14 @@
 ## État
 
 MVP 0.1.x : API, génération de zones BIND9, stockage fichier, séparation public /
-tenant, JWT HS256, tokens API, OpenAPI. named-checkzone est conditionnel ;
-rndc reload est une intégration optionnelle. Les zones sont persistées sur disque,
-sans base de données.
+tenant, JWT HS256, tokens API, OpenAPI. Les zones sont persistées sur disque,
+sans base de données ; BIND reçoit les zones dynamiques via `rndc`.
 
 La spécification du runtime, des limites, de la validation RR et de la
 publication BIND est dans [SPEC-runtime-validation.md](SPEC-runtime-validation.md).
 Les limites d’entrée, la validation RR typée, les verrous par zone, les quotas
-bornés I/O/CPU, et la validation temporaire avant publication sont implémentés.
-La gestion BIND multi-étape et la coalescence des reloads restent à faire.
+bornés I/O/CPU, la validation temporaire, et la publication dynamique BIND avec
+propriété globale des noms sont implémentés.
 
 ## À faire
 
@@ -34,8 +33,9 @@ Ordre d’implémentation proposé ; les identifiants renvoient à
 4. **Travail bloquant et quotas** — `SPEC-IO-01..06` et `SPEC-OBS-02`
    terminées. Les tests couvrent le rejet à saturation, la libération des
    quotas et la conservation des permis quand une requête est annulée.
-5. **Publication BIND** — `SPEC-BIND-*` : création, modification, suppression,
-   reload, délais et état `persisted`/`active`, puis coalescence des reloads.
+5. **Publication BIND** — `SPEC-BIND-01..08` implémentées sur
+   `feat/bind-publisher` : zones dynamiques, réservation du nom au premier
+   tenant, activation/suppression bornées et coalescence des publications.
 6. **Listing et observabilité** — `SPEC-LIST-*`, `SPEC-OBS-*` : pagination ou
    index selon le besoin, timings, erreurs et métriques.
 7. **Vérification** — `SPEC-T-*`, `SPEC-AC-*` : tests unitaires et de
