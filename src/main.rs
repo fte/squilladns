@@ -2,9 +2,10 @@ mod auth;
 mod validation;
 mod zone;
 
-use squilladns::request_limits::{body_limit, RequestLimits};
+use squilladns::request_limits::{body_limit, run_limited, BlockingWorkError, RequestLimits};
 
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -174,6 +175,7 @@ struct AppState {
     tokens: Mutex<TokenStore>,
     jwt: Option<JwtConfig>,
     request_limits: RequestLimits,
+    validation_slots: Arc<tokio::sync::Semaphore>,
     /// Identité imposée par `SANDBOX_USER` (mode dev).
     sandbox: Option<AuthUser>,
 }
@@ -239,6 +241,17 @@ fn step_label(step: &str) -> &str {
 fn timed<T>(timings: &Timings, step: &'static str, f: impl FnOnce() -> T) -> T {
     let start = Instant::now();
     let value = f();
+    timings.record(step, start.elapsed());
+    value
+}
+
+async fn timed_async<T>(
+    timings: &Timings,
+    step: &'static str,
+    future: impl Future<Output = T>,
+) -> T {
+    let start = Instant::now();
+    let value = future.await;
     timings.record(step, start.elapsed());
     value
 }
@@ -519,6 +532,55 @@ fn validation_problem(
     (status, Json(body)).into_response()
 }
 
+enum ZonePayloadError {
+    InvalidJson(String),
+    InvalidRecords(Vec<validation::ValidationError>),
+    Saturated,
+    WorkerFailed,
+}
+
+async fn parse_and_validate_zone_payload(
+    body: Bytes,
+    limits: RequestLimits,
+    slots: Arc<tokio::sync::Semaphore>,
+) -> Result<ZonePayload, ZonePayloadError> {
+    let result = run_limited(slots, move || {
+        let payload = serde_json::from_slice::<ZonePayload>(&body)
+            .map_err(|error| ZonePayloadError::InvalidJson(error.to_string()))?;
+        validation::validate_zone_payload_with_limits(&payload, &limits)
+            .map_err(ZonePayloadError::InvalidRecords)?;
+        Ok(payload)
+    })
+    .await
+    .map_err(|error| match error {
+        BlockingWorkError::Saturated => ZonePayloadError::Saturated,
+        BlockingWorkError::WorkerFailed => ZonePayloadError::WorkerFailed,
+    })?;
+    result
+}
+
+fn zone_payload_error_response(error: ZonePayloadError, instance: &str) -> Response {
+    match error {
+        ZonePayloadError::InvalidJson(error) => err(
+            StatusCode::BAD_REQUEST,
+            &format!("invalid JSON body: {}", error),
+        ),
+        ZonePayloadError::InvalidRecords(errors) => validation_problem(&errors, instance),
+        ZonePayloadError::Saturated => problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Service Unavailable",
+            "zone validation capacity is currently exhausted",
+            instance,
+        ),
+        ZonePayloadError::WorkerFailed => problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal Server Error",
+            "zone validation worker failed",
+            instance,
+        ),
+    }
+}
+
 /// Normalise un nom de zone pour le système de fichiers (sans point final).
 fn normalized_zone_name(raw: &str) -> Result<String, validation::ValidationError> {
     validation::validate_zone_name(raw).map(|zone| zone.trim_end_matches('.').to_string())
@@ -701,6 +763,7 @@ async fn handle_list_zones(
         (status = 200, description = "Zone mise à jour", body = SyncResponse),
         (status = 400, description = "Nom de zone invalide", body = ProblemDetails),
         (status = 422, description = "Zone invalide", body = ProblemDetails),
+        (status = 503, description = "Capacité de validation momentanément saturée", body = ProblemDetails),
         (status = 500, description = "Erreur interne", body = ProblemDetails),
     ),
     security(("bearer_token" = []))
@@ -710,7 +773,7 @@ async fn handle_put_zone(
     Extension(caller): Extension<CallerResolution>,
     Extension(timings): Extension<Timings>,
     UrlPath(name): UrlPath<String>,
-    Json(payload): Json<ZonePayload>,
+    body: Bytes,
 ) -> impl IntoResponse {
     let instance = format!("/zones/{}", name);
     let user = match caller.0 {
@@ -723,11 +786,20 @@ async fn handle_put_zone(
         Err(error) => return validation_problem(&[error], &instance),
     };
 
-    if let Err(errors) = timed(&timings, "validate", || {
-        validation::validate_zone_payload_with_limits(&payload, &state.request_limits)
-    }) {
-        return validation_problem(&errors, &instance);
-    }
+    let payload_result = timed_async(
+        &timings,
+        "validate",
+        parse_and_validate_zone_payload(
+            body,
+            state.request_limits,
+            Arc::clone(&state.validation_slots),
+        ),
+    )
+    .await;
+    let payload = match payload_result {
+        Ok(payload) => payload,
+        Err(error) => return zone_payload_error_response(error, &instance),
+    };
 
     let root = zone_root(&user);
     let zone_file = zone::zone_file_path(&root, &zone_name);
@@ -834,6 +906,7 @@ async fn handle_delete_zone(
         (status = 400, description = "Requête invalide", body = ErrorResponse),
         (status = 404, description = "Zone introuvable", body = ErrorResponse),
         (status = 422, description = "Zone invalide", body = ProblemDetails),
+        (status = 503, description = "Capacité de validation momentanément saturée", body = ProblemDetails),
         (status = 500, description = "Erreur interne", body = ProblemDetails),
     ),
     security(("bearer_token" = []))
@@ -855,14 +928,19 @@ async fn handle_sync(
     let payload = if body.is_empty() {
         None
     } else {
-        match serde_json::from_slice::<ZonePayload>(&body) {
+        match timed_async(
+            &timings,
+            "validate",
+            parse_and_validate_zone_payload(
+                body,
+                state.request_limits,
+                Arc::clone(&state.validation_slots),
+            ),
+        )
+        .await
+        {
             Ok(payload) => Some(payload),
-            Err(error) => {
-                return err(
-                    StatusCode::BAD_REQUEST,
-                    &format!("invalid JSON body: {}", error),
-                );
-            }
+            Err(error) => return zone_payload_error_response(error, INSTANCE),
         }
     };
 
@@ -883,12 +961,6 @@ async fn handle_sync(
 
     let serial = match payload {
         Some(payload) => {
-            if let Err(errors) = timed(&timings, "validate", || {
-                validation::validate_zone_payload_with_limits(&payload, &state.request_limits)
-            }) {
-                return validation_problem(&errors, INSTANCE);
-            }
-
             let serial = zone::compute_serial(zone::read_serial(&zone_file));
             let previous = fs::read_to_string(&zone_file).ok();
             let written = match timed(&timings, "write", || {
@@ -1100,6 +1172,9 @@ async fn main() {
         tokens: Mutex::new(tokens),
         jwt,
         request_limits,
+        validation_slots: Arc::new(tokio::sync::Semaphore::new(
+            request_limits.max_parallel_validations,
+        )),
         sandbox,
     });
 
