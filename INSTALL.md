@@ -6,8 +6,11 @@
 - Port 8085 disponible.
 - Un volume persistant pour les zones et l’état des tokens.
 
-L’image inclut named-checkzone. rndc n’est actif que si l’environnement le
-configure ; l’API ne remplace pas la déclaration des zones dans named.conf.
+L’image inclut `named-checkzone` et `rndc`. La publication utilise les zones
+dynamiques BIND (`rndc addzone`/`delzone`) : activez `allow-new-zones yes` dans
+`named.conf`, donnez à BIND un stockage persistant pour son fichier `.nzf`/`.nzd`
+et montez `ZONES_DIR` au même chemin absolu dans l’API et dans BIND. Les noms
+DNS sont globaux : le premier tenant qui crée une zone en devient propriétaire.
 
 ## Configuration
 
@@ -23,6 +26,9 @@ configure ; l’API ne remplace pas la déclaration des zones dans named.conf.
 | MAX_RECORD_VALUE_BYTES | 4096 | Longueur maximale de la valeur d’un RR, en octets |
 | MAX_PARALLEL_VALIDATIONS | 4 | Nombre maximal de validations/sérialisations CPU simultanées |
 | MAX_PARALLEL_IO | 4 | Nombre maximal d’opérations disque et processus BIND simultanés |
+| RNDC_BIN | rndc | Chemin ou nom de l’exécutable `rndc` |
+| RNDC_CONF | vide | Fichier `rndc.conf` optionnel; monter en lecture seule avec mode 0600 |
+| RNDC_TIMEOUT_SECS | 5 | Délai maximal d’un appel `rndc` (1 à 60 secondes) |
 | JWT_SECRET | vide | Secret HS256 historique, minimum 32 octets |
 | JWT_ED25519_PUBLIC_KEY | vide | Clé publique Ed25519 BFF en base64url (32 octets) ; prioritaire sur JWT_SECRET |
 | BFF_API_AUDIENCE | squilladns | Audience attendue dans le JWT signé par le BFF |
@@ -33,6 +39,11 @@ configure ; l’API ne remplace pas la déclaration des zones dans named.conf.
 Sans API_TOKEN, le secret généré est écrit dans API_TOKEN_PATH et affiché une
 fois dans les logs. Le fichier contient les credentials en clair ; protège le
 volume et les logs.
+
+Le répertoire `.bind-owners` sous `ZONES_DIR` conserve les propriétaires des
+noms entre redémarrages. Ne le supprimez pas séparément des zones. Un échec
+`rndc` laisse la zone persistée mais inactive ; renvoyez PUT ou POST `/sync`
+pour réessayer.
 
 ## Docker Compose
 

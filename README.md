@@ -9,12 +9,12 @@ API Rust pour gérer des zones BIND9 via HTTP. État du projet : MVP 0.1.x.
 
 ## Contrat fonctionnel
 
-- Zones stockées en fichiers sous ZONES_DIR, séparées en public et tenants.
+- Fichiers de zones séparés par tenant ; noms DNS uniques globalement, attribués au premier tenant qui les crée.
 - PUT /zones/{name} remplace une zone ; DELETE la supprime ; GET /zones la liste.
 - SOA généré automatiquement ; NS apex ajouté si absent.
 - Types acceptés : A, AAAA, CNAME, MX, NS, TXT, SRV, CAA.
 - Serial : max(serial existant + 1, date UTC).
-- named-checkzone et rndc sont utilisés lorsqu’ils sont disponibles.
+- `named-checkzone` valide les fichiers temporaires ; `rndc addzone`/`delzone` publient les zones dynamiques dans BIND (`allow-new-zones yes`).
 - Écriture restaurée si la validation finale échoue.
 - Un bearer invalide renvoie 401 ; il ne bascule jamais vers le scope public.
 - JWT EdDSA du BFF (HS256 historique) ou token API ; POST /token émet un token lié au même tenant.

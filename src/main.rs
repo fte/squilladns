@@ -2,6 +2,7 @@ mod auth;
 mod validation;
 mod zone;
 
+use squilladns::bind::{self, RndcClient, RndcError};
 use squilladns::request_limits::{
     body_limit, run_limited, run_limited_by, BlockingWorkError, RequestLimits,
 };
@@ -10,7 +11,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
@@ -78,6 +78,7 @@ const HEADER_TIMING_ALLOW_ORIGIN: HeaderName = HeaderName::from_static("timing-a
         TokenResponse,
         TokenRequest,
         SyncResponse,
+        DeleteResponse,
         SyncQuery,
         ErrorResponse,
         ProblemDetails,
@@ -147,6 +148,17 @@ struct SyncResponse {
     scope: String,
 }
 
+#[derive(Serialize, ToSchema)]
+struct DeleteResponse {
+    status: String,
+    persisted: bool,
+    /// Résultat de la désactivation BIND, absent si le mode dynamique est désactivé.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    active: Option<bool>,
+    zone: String,
+    scope: String,
+}
+
 #[derive(Deserialize, ToSchema)]
 pub struct SyncQuery {
     /// Nom de la zone (obligatoire si aucun body JSON)
@@ -186,13 +198,15 @@ struct AppState {
     request_limits: RequestLimits,
     validation_slots: Arc<tokio::sync::Semaphore>,
     io_slots: Arc<tokio::sync::Semaphore>,
+    rndc: RndcClient,
+    publications: PublicationQueue,
     zone_locks: ZoneLocks,
     /// Identité imposée par `SANDBOX_USER` (mode dev).
     sandbox: Option<AuthUser>,
 }
 
-#[derive(Default)]
-struct ZoneLocks(Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>);
+#[derive(Clone, Default)]
+struct ZoneLocks(Arc<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>);
 
 impl ZoneLocks {
     async fn lock(&self, key: String) -> tokio::sync::OwnedMutexGuard<()> {
@@ -215,8 +229,124 @@ async fn lock_zone(state: &AppState, key: String) -> tokio::sync::OwnedMutexGuar
     state.zone_locks.lock(key).await
 }
 
-fn zone_lock_key(root: &Path, zone_name: &str) -> String {
-    root.join(zone_name).to_string_lossy().into_owned()
+struct PublicationRequest {
+    root: PathBuf,
+    zone_name: String,
+    tenant: String,
+    reply: tokio::sync::oneshot::Sender<bool>,
+}
+
+#[derive(Clone)]
+struct PublicationQueue {
+    sender: tokio::sync::mpsc::Sender<PublicationRequest>,
+}
+
+impl PublicationQueue {
+    fn new(rndc: RndcClient, io_slots: Arc<tokio::sync::Semaphore>, zone_locks: ZoneLocks) -> Self {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<PublicationRequest>(256);
+        tokio::spawn(async move {
+            while let Some(first) = receiver.recv().await {
+                let mut batches: HashMap<String, Vec<PublicationRequest>> = HashMap::new();
+                batches
+                    .entry(first.zone_name.clone())
+                    .or_default()
+                    .push(first);
+
+                let debounce = tokio::time::sleep(std::time::Duration::from_millis(40));
+                tokio::pin!(debounce);
+                loop {
+                    tokio::select! {
+                        _ = &mut debounce => break,
+                        request = receiver.recv() => match request {
+                            Some(request) => batches.entry(request.zone_name.clone()).or_default().push(request),
+                            None => break,
+                        }
+                    }
+                }
+
+                for (zone_name, requests) in batches {
+                    let last = requests.last().expect("nonempty publication batch");
+                    let root = last.root.clone();
+                    let tenant = last.tenant.clone();
+                    let rndc = rndc.clone();
+                    let locks = zone_locks.clone();
+                    let lock = locks.lock(zone_lock_key(&zone_name)).await;
+                    let result = run_limited(Arc::clone(&io_slots), move || {
+                        let _zone_guard = lock;
+                        let owners_dir = zone_owners_dir();
+                        let owner = match bind::read_zone_owner(&owners_dir, &zone_name) {
+                            Ok(Some(owner)) if owner.tenant == tenant => owner,
+                            Ok(_) => return false,
+                            Err(error) => {
+                                tracing::warn!("could not read zone ownership state: {:?}", error);
+                                return false;
+                            }
+                        };
+                        let zone_file = zone::zone_file_path(&root, &zone_name);
+                        let canonical_file = match fs::canonicalize(zone_file) {
+                            Ok(path) => path,
+                            Err(_) => return false,
+                        };
+                        let Some(canonical_file) = canonical_file.to_str() else {
+                            return false;
+                        };
+                        if let Err(error) = rndc.activate_zone(
+                            &zone_name,
+                            canonical_file,
+                            owner.state == bind::OwnerState::Active,
+                        ) {
+                            tracing::warn!("BIND activation failed for {}: {:?}", zone_name, error);
+                            return false;
+                        }
+                        if bind::set_zone_owner_state(
+                            &owners_dir,
+                            &zone_name,
+                            &tenant,
+                            bind::OwnerState::Active,
+                        )
+                        .is_err()
+                        {
+                            tracing::error!(
+                                "could not update BIND ownership state for {}",
+                                zone_name
+                            );
+                            return false;
+                        }
+                        true
+                    })
+                    .await
+                    .unwrap_or(false);
+
+                    for request in requests {
+                        let _ = request.reply.send(result);
+                    }
+                }
+            }
+        });
+        Self { sender }
+    }
+
+    async fn publish(&self, root: PathBuf, zone_name: String, tenant: String) -> bool {
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let request = PublicationRequest {
+            root,
+            zone_name,
+            tenant,
+            reply,
+        };
+        if self.sender.try_send(request).is_err() {
+            return false;
+        }
+        response.await.unwrap_or(false)
+    }
+}
+
+fn zone_lock_key(zone_name: &str) -> String {
+    zone::zones_dir()
+        .join(".zone-locks")
+        .join(zone_name)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Résultat d'authentification calculé une seule fois par le middleware,
@@ -634,31 +764,16 @@ fn check_zone_file(zone_name: &str, zone_file: &Path) -> Result<(), validation::
     validation::validate_zone_file_with_named_checkzone(zone_name, zone_file)
 }
 
-/// Recharge la zone dans BIND9 si `rndc` est disponible.
-fn rndc_reload(zone_name: &str) -> bool {
-    match Command::new("rndc").args(["reload", zone_name]).output() {
-        Ok(output) if output.status.success() => {
-            tracing::info!("rndc reload {}: ok", zone_name);
-            true
-        }
-        Ok(output) => {
-            tracing::warn!(
-                "rndc reload {}: {}",
-                zone_name,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-            false
-        }
-        Err(error) => {
-            tracing::debug!("rndc indisponible: {}", error);
-            false
-        }
-    }
-}
-
 enum ZoneWriteError {
     Io(String),
     Validation(validation::ValidationError),
+    OwnerConflict,
+    OwnerIo,
+}
+
+struct ZoneWriteOutcome {
+    created: bool,
+    serial: i32,
 }
 
 /// La cible n'est remplacée qu'après validation du fichier temporaire. Le Drop
@@ -695,6 +810,120 @@ fn write_zone_transaction_with(
     validate(zone_name, prepared.path()).map_err(ZoneWriteError::Validation)?;
     prepared.publish().map_err(ZoneWriteError::Io)?;
     Ok((created, serial))
+}
+
+fn zone_owner_id(user: &Option<AuthUser>) -> String {
+    user.as_ref()
+        .map(|user| user.tenant.clone())
+        .unwrap_or_else(|| "public".into())
+}
+
+fn zone_owners_dir() -> PathBuf {
+    zone::zones_dir().join(".bind-owners")
+}
+
+fn write_zone_work(
+    root: &Path,
+    zone_name: &str,
+    records: &[validation::ValidatedRecord],
+    tenant: &str,
+) -> Result<ZoneWriteOutcome, ZoneWriteError> {
+    let owners_dir = zone_owners_dir();
+    let claim =
+        bind::claim_zone_owner(&owners_dir, zone_name, tenant).map_err(|error| match error {
+            bind::OwnerError::Conflict => ZoneWriteError::OwnerConflict,
+            bind::OwnerError::Io => ZoneWriteError::OwnerIo,
+        })?;
+
+    let (created, serial) = match write_zone_transaction(root, zone_name, records) {
+        Ok(result) => result,
+        Err(error) => {
+            if claim.created {
+                if let Err(release_error) = bind::release_zone_owner(&owners_dir, zone_name, tenant)
+                {
+                    tracing::warn!("could not release failed zone claim: {:?}", release_error);
+                }
+            }
+            return Err(error);
+        }
+    };
+
+    Ok(ZoneWriteOutcome { created, serial })
+}
+
+enum ZoneSyncError {
+    Zone(ZoneWriteError),
+    NotFound,
+}
+
+fn sync_existing_zone_work(
+    root: &Path,
+    zone_name: &str,
+    tenant: &str,
+) -> Result<i32, ZoneSyncError> {
+    let zone_file = zone::zone_file_path(root, zone_name);
+    let contents = match fs::read_to_string(&zone_file) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ZoneSyncError::NotFound)
+        }
+        Err(error) => {
+            return Err(ZoneSyncError::Zone(ZoneWriteError::Io(format!(
+                "failed to read current zone: {}",
+                error
+            ))))
+        }
+    };
+    let serial = zone::serial_from_contents(&contents).ok_or(ZoneSyncError::NotFound)?;
+
+    let owners_dir = zone_owners_dir();
+    bind::claim_zone_owner(&owners_dir, zone_name, tenant).map_err(|error| {
+        ZoneSyncError::Zone(match error {
+            bind::OwnerError::Conflict => ZoneWriteError::OwnerConflict,
+            bind::OwnerError::Io => ZoneWriteError::OwnerIo,
+        })
+    })?;
+    Ok(serial)
+}
+
+enum ZoneDeleteError {
+    NotFound,
+    OwnerConflict,
+    OwnerIo,
+    Bind(RndcError),
+    Io(std::io::Error),
+}
+
+fn delete_zone_work(
+    root: &Path,
+    zone_name: &str,
+    tenant: &str,
+    rndc: &RndcClient,
+) -> Result<Option<bool>, ZoneDeleteError> {
+    let zone_path = root.join(zone_name);
+    if !zone_path.is_dir() {
+        return Err(ZoneDeleteError::NotFound);
+    }
+
+    let owners_dir = zone_owners_dir();
+    let claim =
+        bind::claim_zone_owner(&owners_dir, zone_name, tenant).map_err(|error| match error {
+            bind::OwnerError::Conflict => ZoneDeleteError::OwnerConflict,
+            bind::OwnerError::Io => ZoneDeleteError::OwnerIo,
+        })?;
+    if claim.state == bind::OwnerState::Active {
+        rndc.delete_zone(zone_name).map_err(|error| {
+            tracing::warn!("BIND deletion failed for {}: {:?}", zone_name, error);
+            ZoneDeleteError::Bind(error)
+        })?;
+        bind::set_zone_owner_state(&owners_dir, zone_name, tenant, bind::OwnerState::Inactive)
+            .map_err(|_| ZoneDeleteError::OwnerIo)?;
+    }
+    fs::remove_dir_all(&zone_path).map_err(ZoneDeleteError::Io)?;
+    bind::release_zone_owner(&owners_dir, zone_name, tenant)
+        .map_err(|_| ZoneDeleteError::OwnerIo)?;
+
+    Ok(Some(false))
 }
 
 // ---------------------------------------------------------------------------
@@ -885,9 +1114,12 @@ async fn handle_put_zone(
     };
 
     let root = zone_root(&user);
-    let zone_guard = lock_zone(&state, zone_lock_key(&root, &zone_name)).await;
+    let zone_guard = lock_zone(&state, zone_lock_key(&zone_name)).await;
     let user_for_work = user.clone();
     let name_for_work = zone_name.clone();
+    let tenant = zone_owner_id(&user);
+    let tenant_for_work = tenant.clone();
+    let root_for_work = root.clone();
     let write_result = timed_async(
         &timings,
         "write",
@@ -898,13 +1130,13 @@ async fn handle_put_zone(
             ],
             move || {
                 let _zone_guard = zone_guard;
-                migrate_legacy_zone_root(&user_for_work, &root);
-                write_zone_transaction(&root, &name_for_work, &payload)
+                migrate_legacy_zone_root(&user_for_work, &root_for_work);
+                write_zone_work(&root_for_work, &name_for_work, &payload, &tenant_for_work)
             },
         ),
     )
     .await;
-    let (created, serial) = match write_result {
+    let outcome = match write_result {
         Err(BlockingWorkError::Saturated) => {
             return problem(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -932,23 +1164,43 @@ async fn handle_put_zone(
         Ok(Err(ZoneWriteError::Validation(error))) => {
             return validation_problem(&[error], &instance)
         }
+        Ok(Err(ZoneWriteError::OwnerConflict)) => {
+            return problem(
+                StatusCode::CONFLICT,
+                "Conflict",
+                "zone name is owned by another tenant",
+                &instance,
+            )
+        }
+        Ok(Err(ZoneWriteError::OwnerIo)) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error",
+                "zone ownership could not be read or updated",
+                &instance,
+            )
+        }
         Ok(Ok(result)) => result,
     };
 
-    let (code, status) = if created {
+    let (code, status) = if outcome.created {
         (StatusCode::CREATED, "created")
     } else {
         (StatusCode::OK, "updated")
     };
+    let active = state
+        .publications
+        .publish(root, zone_name.clone(), tenant)
+        .await;
 
     (
         code,
         Json(SyncResponse {
             status: status.into(),
             persisted: true,
-            active: None,
+            active: Some(active),
             zone: zone_name,
-            serial: serial.to_string(),
+            serial: outcome.serial.to_string(),
             scope: scope_of(&user),
         }),
     )
@@ -961,8 +1213,9 @@ async fn handle_put_zone(
     path = "/zones/{name}",
     params(("name" = String, Path, description = "Nom de la zone (ex. alpha.test)")),
     responses(
-        (status = 204, description = "Zone supprimée"),
+        (status = 200, description = "Zone supprimée", body = DeleteResponse),
         (status = 404, description = "Zone introuvable", body = ErrorResponse),
+        (status = 409, description = "Zone appartenant à un autre tenant", body = ProblemDetails),
         (status = 503, description = "Capacité I/O momentanément saturée", body = ProblemDetails),
         (status = 400, description = "Nom invalide", body = ProblemDetails),
         (status = 422, description = "Nom invalide", body = ProblemDetails),
@@ -988,19 +1241,18 @@ async fn handle_delete_zone(
     };
 
     let root = zone_root(&user);
-    let zone_guard = lock_zone(&state, zone_lock_key(&root, &zone_name)).await;
+    let zone_guard = lock_zone(&state, zone_lock_key(&zone_name)).await;
     let user_for_work = user.clone();
-    let zone_path = root.join(&zone_name);
+    let name_for_work = zone_name.clone();
+    let tenant = zone_owner_id(&user);
+    let rndc = state.rndc.clone();
     let deletion = timed_async(
         &timings,
         "delete",
         run_limited(Arc::clone(&state.io_slots), move || {
             let _zone_guard = zone_guard;
             migrate_legacy_zone_root(&user_for_work, &root);
-            if !zone_path.is_dir() {
-                return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
-            }
-            fs::remove_dir_all(&zone_path)
+            delete_zone_work(&root, &name_for_work, &tenant, &rndc)
         }),
     )
     .await;
@@ -1017,11 +1269,34 @@ async fn handle_delete_zone(
             "I/O worker failed",
             &instance,
         ),
-        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
-        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            err(StatusCode::NOT_FOUND, "zone not found")
-        }
-        Ok(Err(error)) => problem(
+        Ok(Ok(active)) => Json(DeleteResponse {
+            status: "deleted".into(),
+            persisted: true,
+            active,
+            zone: zone_name,
+            scope: scope_of(&user),
+        })
+        .into_response(),
+        Ok(Err(ZoneDeleteError::NotFound)) => err(StatusCode::NOT_FOUND, "zone not found"),
+        Ok(Err(ZoneDeleteError::OwnerConflict)) => problem(
+            StatusCode::CONFLICT,
+            "Conflict",
+            "zone name is owned by another tenant",
+            &instance,
+        ),
+        Ok(Err(ZoneDeleteError::OwnerIo)) => problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal Server Error",
+            "zone ownership could not be read or updated",
+            &instance,
+        ),
+        Ok(Err(ZoneDeleteError::Bind(_error))) => problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Service Unavailable",
+            "BIND could not remove the zone; zone files remain available for retry",
+            &instance,
+        ),
+        Ok(Err(ZoneDeleteError::Io(error))) => problem(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Internal Server Error",
             &format!("failed to delete zone: {}", error),
@@ -1095,9 +1370,12 @@ async fn handle_sync(
     };
 
     let root = zone_root(&user);
-    let zone_guard = lock_zone(&state, zone_lock_key(&root, &zone_name)).await;
+    let zone_guard = lock_zone(&state, zone_lock_key(&zone_name)).await;
     let user_for_work = user.clone();
     let name_for_work = zone_name.clone();
+    let tenant = zone_owner_id(&user);
+    let root_for_work = root.clone();
+    let tenant_for_work = tenant.clone();
     let serial_result = timed_async(
         &timings,
         "write",
@@ -1108,21 +1386,23 @@ async fn handle_sync(
             ],
             move || {
                 let _zone_guard = zone_guard;
-                migrate_legacy_zone_root(&user_for_work, &root);
-                let serial = match payload {
-                    Some(records) => write_zone_transaction(&root, &name_for_work, &records)?.1,
-                    None => match zone::read_serial(&zone::zone_file_path(&root, &name_for_work)) {
-                        Some(serial) => serial,
-                        None => return Ok(None),
-                    },
-                };
-                let reloaded = rndc_reload(&name_for_work);
-                Ok(Some((serial, reloaded)))
+                migrate_legacy_zone_root(&user_for_work, &root_for_work);
+                match payload {
+                    Some(records) => {
+                        write_zone_work(&root_for_work, &name_for_work, &records, &tenant_for_work)
+                            .map(|outcome| Some(outcome.serial))
+                            .map_err(ZoneSyncError::Zone)
+                    }
+                    None => {
+                        sync_existing_zone_work(&root_for_work, &name_for_work, &tenant_for_work)
+                            .map(Some)
+                    }
+                }
             },
         ),
     )
     .await;
-    let (serial, reloaded) = match serial_result {
+    let serial = match serial_result {
         Err(BlockingWorkError::Saturated) => {
             return problem(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1139,7 +1419,7 @@ async fn handle_sync(
                 INSTANCE,
             )
         }
-        Ok(Err(ZoneWriteError::Io(error))) => {
+        Ok(Err(ZoneSyncError::Zone(ZoneWriteError::Io(error)))) => {
             return problem(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal Server Error",
@@ -1147,8 +1427,30 @@ async fn handle_sync(
                 INSTANCE,
             )
         }
-        Ok(Err(ZoneWriteError::Validation(error))) => {
+        Ok(Err(ZoneSyncError::Zone(ZoneWriteError::Validation(error)))) => {
             return validation_problem(&[error], INSTANCE)
+        }
+        Ok(Err(ZoneSyncError::Zone(ZoneWriteError::OwnerConflict))) => {
+            return problem(
+                StatusCode::CONFLICT,
+                "Conflict",
+                "zone name is owned by another tenant",
+                INSTANCE,
+            )
+        }
+        Ok(Err(ZoneSyncError::Zone(ZoneWriteError::OwnerIo))) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error",
+                "zone ownership could not be read or updated",
+                INSTANCE,
+            )
+        }
+        Ok(Err(ZoneSyncError::NotFound)) => {
+            return err(
+                StatusCode::NOT_FOUND,
+                &format!("zone {} not found", zone_name),
+            )
         }
         Ok(Ok(Some(result))) => result,
         Ok(Ok(None)) => {
@@ -1159,10 +1461,15 @@ async fn handle_sync(
         }
     };
 
+    let active = state
+        .publications
+        .publish(root, zone_name.clone(), tenant)
+        .await;
+
     Json(SyncResponse {
-        status: if reloaded { "reloaded" } else { "synced" }.into(),
+        status: if active { "reloaded" } else { "persisted" }.into(),
         persisted: true,
-        active: Some(reloaded),
+        active: Some(active),
         zone: zone_name,
         serial: serial.to_string(),
         scope: scope_of(&user),
@@ -1342,6 +1649,14 @@ async fn main() {
         }
     };
 
+    let rndc = match RndcClient::from_env() {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("rndc config: {}", error);
+            std::process::exit(1);
+        }
+    };
+
     let token_env = std::env::var("API_TOKEN").unwrap_or_default();
     let token_path = PathBuf::from(
         std::env::var("API_TOKEN_PATH").unwrap_or_else(|_| ".state/tokens".to_string()),
@@ -1367,6 +1682,10 @@ async fn main() {
         );
     }
 
+    let io_slots = Arc::new(tokio::sync::Semaphore::new(request_limits.max_parallel_io));
+    let zone_locks = ZoneLocks::default();
+    let publications =
+        PublicationQueue::new(rndc.clone(), Arc::clone(&io_slots), zone_locks.clone());
     let state = Arc::new(AppState {
         tokens: Arc::new(Mutex::new(tokens)),
         token_updates: Arc::new(tokio::sync::Mutex::new(())),
@@ -1375,8 +1694,10 @@ async fn main() {
         validation_slots: Arc::new(tokio::sync::Semaphore::new(
             request_limits.max_parallel_validations,
         )),
-        io_slots: Arc::new(tokio::sync::Semaphore::new(request_limits.max_parallel_io)),
-        zone_locks: ZoneLocks::default(),
+        io_slots,
+        rndc,
+        publications,
+        zone_locks,
         sandbox,
     });
 
