@@ -9,10 +9,10 @@ sans base de données.
 
 La spécification du runtime, des limites, de la validation RR et de la
 publication BIND est dans [SPEC-runtime-validation.md](SPEC-runtime-validation.md).
-Les limites d’entrée, la validation et sérialisation RR typées, le remplacement
-complet des RR, les verrous par zone et le remplacement atomique des fichiers
-sont implémentés. La validation `named-checkzone` reste postérieure à l’écriture ;
-la publication après validation préalable est encore à faire.
+Les limites d’entrée, la validation RR typée, les verrous par zone, le
+remplacement atomique et les quotas bornés I/O/CPU sont implémentés. La
+validation `named-checkzone` reste postérieure à l’écriture ; la publication
+après validation préalable est encore à faire.
 
 ## À faire
 
@@ -32,11 +32,9 @@ Ordre d’implémentation proposé ; les identifiants renvoient à
    partagé par PUT, sync et DELETE ; remplacement du fichier par renommage
    atomique. À faire : valider le fichier temporaire avec `named-checkzone`
    avant publication et définir complètement les échecs (`SPEC-WRITE-*`).
-4. **Travail bloquant et quotas** — `SPEC-IO-01..03`, `SPEC-IO-05..06`,
-   `SPEC-OBS-02` : filesystem, calcul et processus hors des workers HTTP, avec
-   concurrence bornée. Première étape amorcée sur listing/suppression avec
-   `MAX_PARALLEL_IO`; les écritures de zones et les processus BIND restent à
-   déplacer.
+4. **Travail bloquant et quotas** — `SPEC-IO-01..06` et `SPEC-OBS-02`
+   terminées. Les tests couvrent le rejet à saturation, la libération des
+   quotas et la conservation des permis quand une requête est annulée.
 5. **Publication BIND** — `SPEC-BIND-*` : création, modification, suppression,
    reload, délais et état `persisted`/`active`, puis coalescence des reloads.
 6. **Listing et observabilité** — `SPEC-LIST-*`, `SPEC-OBS-*` : pagination ou

@@ -142,11 +142,30 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    let permit: OwnedSemaphorePermit = semaphore
-        .try_acquire_owned()
-        .map_err(|_| BlockingWorkError::Saturated)?;
+    run_limited_by(vec![semaphore], work).await
+}
+
+/// Exécute un travail qui consomme plusieurs quotas indépendants. Tous les
+/// permis sont pris immédiatement ou aucun travail n'est lancé.
+pub async fn run_limited_by<F, T>(
+    semaphores: Vec<Arc<Semaphore>>,
+    work: F,
+) -> Result<T, BlockingWorkError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let permits: Result<Vec<OwnedSemaphorePermit>, BlockingWorkError> = semaphores
+        .into_iter()
+        .map(|semaphore| {
+            semaphore
+                .try_acquire_owned()
+                .map_err(|_| BlockingWorkError::Saturated)
+        })
+        .collect();
+    let permits = permits?;
     tokio::task::spawn_blocking(move || {
-        let _permit = permit;
+        let _permits = permits;
         work()
     })
     .await

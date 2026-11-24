@@ -4,7 +4,9 @@ use axum::{
     routing::post,
     Router,
 };
-use squilladns::request_limits::{body_limit, run_limited, BlockingWorkError, RequestLimits};
+use squilladns::request_limits::{
+    body_limit, run_limited, run_limited_by, BlockingWorkError, RequestLimits,
+};
 use std::sync::{mpsc, Arc};
 use tokio::sync::Semaphore;
 use tower::ServiceExt;
@@ -87,4 +89,45 @@ async fn bounded_blocking_work_rejects_when_all_validation_slots_are_busy() {
 
     release_tx.send(()).unwrap();
     assert_eq!(first.await.unwrap().unwrap(), 42);
+}
+
+#[tokio::test]
+async fn multi_quota_work_releases_partial_permits_when_one_quota_is_full() {
+    let io_slots = Arc::new(Semaphore::new(1));
+    let cpu_slots = Arc::new(Semaphore::new(1));
+    let _cpu_permit = cpu_slots.clone().acquire_owned().await.unwrap();
+
+    let result = run_limited_by(vec![Arc::clone(&io_slots), Arc::clone(&cpu_slots)], || 1).await;
+    assert_eq!(result, Err(BlockingWorkError::Saturated));
+    assert!(
+        io_slots.try_acquire().is_ok(),
+        "le quota I/O doit être rendu"
+    );
+}
+
+#[tokio::test]
+async fn blocking_worker_keeps_its_permit_after_request_cancellation() {
+    let slots = Arc::new(Semaphore::new(1));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+    let worker_slots = Arc::clone(&slots);
+    let request = tokio::spawn(async move {
+        run_limited(worker_slots, move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            finished_tx.send(()).unwrap();
+        })
+        .await
+    });
+
+    started_rx.await.unwrap();
+    request.abort();
+    assert_eq!(
+        run_limited(Arc::clone(&slots), || ()).await,
+        Err(BlockingWorkError::Saturated)
+    );
+    release_tx.send(()).unwrap();
+    finished_rx.await.unwrap();
+    assert_eq!(run_limited(slots, || ()).await, Ok(()));
 }
