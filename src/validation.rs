@@ -6,8 +6,38 @@ use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
+
+const DEFAULT_CHECKZONE_TIMEOUT_SECS: u64 = 5;
+static CHECKZONE_TIMEOUT: OnceLock<Duration> = OnceLock::new();
+
+pub fn configure_checkzone_timeout_from_env() -> Result<(), String> {
+    let configured = match std::env::var("CHECKZONE_TIMEOUT_SECS") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("CHECKZONE_TIMEOUT_SECS must be valid UTF-8".into())
+        }
+    };
+    let timeout = parse_checkzone_timeout(configured.as_deref())?;
+    CHECKZONE_TIMEOUT
+        .set(timeout)
+        .map_err(|_| "named-checkzone timeout was already configured".to_string())
+}
+
+fn parse_checkzone_timeout(value: Option<&str>) -> Result<Duration, String> {
+    let seconds = match value {
+        Some(value) => value
+            .parse::<u64>()
+            .ok()
+            .filter(|seconds| (1..=60).contains(seconds))
+            .ok_or_else(|| "CHECKZONE_TIMEOUT_SECS must be between 1 and 60".to_string())?,
+        None => DEFAULT_CHECKZONE_TIMEOUT_SECS,
+    };
+    Ok(Duration::from_secs(seconds))
+}
 use thiserror::Error;
 
 /// RFC 7807 Problem Details error
@@ -784,11 +814,14 @@ pub fn validate_zone_file_with_named_checkzone(
     zone_name: &str,
     zone_file_path: &Path,
 ) -> Result<(), ValidationError> {
-    const CHECKZONE_TIMEOUT: Duration = Duration::from_secs(5);
+    let checkzone_timeout = CHECKZONE_TIMEOUT
+        .get()
+        .copied()
+        .unwrap_or(Duration::from_secs(DEFAULT_CHECKZONE_TIMEOUT_SECS));
     let mut command = Command::new("named-checkzone");
     command.args([zone_name, zone_file_path.to_str().unwrap_or("")]);
 
-    match run_command_with_timeout(&mut command, CHECKZONE_TIMEOUT) {
+    match run_command_with_timeout(&mut command, checkzone_timeout) {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(ValidationError::new(
             ValidationErrorCode::ZoneValidationFailed,
@@ -889,6 +922,20 @@ pub fn validation_errors_to_problem_details(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn checkzone_timeout_is_bounded_and_configurable() {
+        assert_eq!(
+            parse_checkzone_timeout(None).unwrap(),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            parse_checkzone_timeout(Some("12")).unwrap(),
+            Duration::from_secs(12)
+        );
+        assert!(parse_checkzone_timeout(Some("0")).is_err());
+        assert!(parse_checkzone_timeout(Some("61")).is_err());
+    }
 
     #[test]
     fn test_validate_zone_name_valid() {

@@ -156,6 +156,9 @@ struct SyncResponse {
     /// Résultat du rechargement demandé ; absent si aucun reload n'a été demandé.
     #[serde(skip_serializing_if = "Option::is_none")]
     active: Option<bool>,
+    /// Code machine lisible si la zone a été persistée mais pas activée.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activation_error: Option<String>,
     zone: String,
     serial: String,
     scope: String,
@@ -238,15 +241,78 @@ impl ZoneLocks {
     }
 }
 
-async fn lock_zone(state: &AppState, key: String) -> tokio::sync::OwnedMutexGuard<()> {
-    state.zone_locks.lock(key).await
+async fn lock_zone(
+    state: &AppState,
+    key: String,
+    timings: &Timings,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    let start = Instant::now();
+    let guard = state.zone_locks.lock(key).await;
+    timings.record("lock", start.elapsed());
+    guard
 }
 
 struct PublicationRequest {
     root: PathBuf,
     zone_name: String,
     tenant: String,
-    reply: tokio::sync::oneshot::Sender<bool>,
+    queued_at: Instant,
+    timings: Timings,
+    reply: tokio::sync::oneshot::Sender<Result<(), PublicationError>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicationError {
+    Saturated,
+    WorkerFailed,
+    Ownership,
+    ZoneFile,
+    StatePersistence,
+    Rndc(RndcError),
+}
+
+impl PublicationError {
+    fn code(self) -> &'static str {
+        match self {
+            Self::Saturated => "publication_capacity_exhausted",
+            Self::WorkerFailed => "publication_worker_failed",
+            Self::Ownership => "zone_ownership_unavailable",
+            Self::ZoneFile => "zone_file_unavailable",
+            Self::StatePersistence => "publication_state_persistence_failed",
+            Self::Rndc(RndcError::Unavailable) => "rndc_unavailable",
+            Self::Rndc(RndcError::TimedOut) => "rndc_timeout",
+            Self::Rndc(RndcError::SpawnFailed) => "rndc_spawn_failed",
+            Self::Rndc(RndcError::CommandFailed(_)) => "rndc_command_failed",
+        }
+    }
+}
+
+fn activate_owned_zone(
+    rndc: &RndcClient,
+    owners_dir: &Path,
+    zone_name: &str,
+    tenant: &str,
+    zone_file: &str,
+    previous_state: bind::OwnerState,
+    timings: &[Timings],
+) -> Result<(), PublicationError> {
+    bind::set_zone_owner_state(owners_dir, zone_name, tenant, bind::OwnerState::Activating)
+        .map_err(|_| PublicationError::StatePersistence)?;
+
+    let rndc_start = Instant::now();
+    let activation = rndc.activate_zone(
+        zone_name,
+        zone_file,
+        previous_state != bind::OwnerState::Inactive,
+    );
+    let rndc_elapsed = rndc_start.elapsed();
+    for timing in timings {
+        timing.record("rndc", rndc_elapsed);
+    }
+    activation.map_err(PublicationError::Rndc)?;
+
+    bind::set_zone_owner_state(owners_dir, zone_name, tenant, bind::OwnerState::Active)
+        .map_err(|_| PublicationError::StatePersistence)
 }
 
 #[derive(Clone)]
@@ -281,68 +347,70 @@ impl PublicationQueue {
                     let last = requests.last().expect("nonempty publication batch");
                     let root = last.root.clone();
                     let tenant = last.tenant.clone();
+                    let request_timings: Vec<_> = requests
+                        .iter()
+                        .map(|request| (request.timings.clone(), request.queued_at))
+                        .collect();
+                    let request_id = request_timings
+                        .first()
+                        .map(|(timings, _)| timings.request_id())
+                        .unwrap_or_else(|| "unknown".into());
                     let rndc = rndc.clone();
                     let locks = zone_locks.clone();
                     let lock = locks.lock(zone_lock_key(&zone_name)).await;
                     let result = run_limited(Arc::clone(&io_slots), move || {
                         let _zone_guard = lock;
+                        for (timings, queued_at) in &request_timings {
+                            timings.record(
+                                "queue",
+                                Instant::now().saturating_duration_since(*queued_at),
+                            );
+                        }
                         let owners_dir = zone_owners_dir();
                         let owner = match bind::read_zone_owner(&owners_dir, &zone_name) {
                             Ok(Some(owner)) if owner.tenant == tenant => owner,
-                            Ok(_) => return false,
+                            Ok(_) => return Err(PublicationError::Ownership),
                             Err(error) => {
-                                tracing::warn!("could not read zone ownership state: {:?}", error);
-                                return false;
+                                tracing::warn!(request_id = %request_id, error = ?error, "could not read zone ownership state");
+                                return Err(PublicationError::Ownership);
                             }
                         };
                         let zone_file = zone::zone_file_path(&root, &zone_name);
                         let canonical_file = match fs::canonicalize(zone_file) {
                             Ok(path) => path,
-                            Err(_) => return false,
+                            Err(_) => return Err(PublicationError::ZoneFile),
                         };
                         let Some(canonical_file) = canonical_file.to_str() else {
-                            return false;
+                            return Err(PublicationError::ZoneFile);
                         };
-                        if bind::set_zone_owner_state(
+                        let activation = activate_owned_zone(
+                            &rndc,
                             &owners_dir,
                             &zone_name,
                             &tenant,
-                            bind::OwnerState::Activating,
-                        )
-                        .is_err()
-                        {
-                            tracing::error!(
-                                "could not persist pending BIND activation for {}",
-                                zone_name
-                            );
-                            return false;
-                        }
-                        if let Err(error) = rndc.activate_zone(
-                            &zone_name,
                             canonical_file,
-                            owner.state != bind::OwnerState::Inactive,
-                        ) {
-                            tracing::warn!("BIND activation failed for {}: {:?}", zone_name, error);
-                            return false;
+                            owner.state,
+                            &request_timings
+                                .iter()
+                                .map(|(timings, _)| timings.clone())
+                                .collect::<Vec<_>>(),
+                        );
+                        if let Err(error) = activation {
+                            if let PublicationError::Rndc(error) = error {
+                            tracing::warn!(request_id = %request_id, zone = %zone_name, error = ?error, "BIND activation failed");
+                            } else {
+                                tracing::error!(request_id = %request_id, zone = %zone_name, code = error.code(), "BIND activation state update failed");
+                            }
+                            return Err(error);
                         }
-                        if bind::set_zone_owner_state(
-                            &owners_dir,
-                            &zone_name,
-                            &tenant,
-                            bind::OwnerState::Active,
-                        )
-                        .is_err()
-                        {
-                            tracing::error!(
-                                "could not update BIND ownership state for {}",
-                                zone_name
-                            );
-                            return false;
-                        }
-                        true
+                        Ok(())
                     })
                     .await
-                    .unwrap_or(false);
+                    .map_err(|error| match error {
+                        BlockingWorkError::Saturated => PublicationError::Saturated,
+                        BlockingWorkError::WorkerFailed => PublicationError::WorkerFailed,
+                    })
+                    .and_then(|result| result);
 
                     for request in requests {
                         let _ = request.reply.send(result);
@@ -353,18 +421,28 @@ impl PublicationQueue {
         Self { sender }
     }
 
-    async fn publish(&self, root: PathBuf, zone_name: String, tenant: String) -> bool {
+    async fn publish(
+        &self,
+        root: PathBuf,
+        zone_name: String,
+        tenant: String,
+        timings: Timings,
+    ) -> Result<(), PublicationError> {
         let (reply, response) = tokio::sync::oneshot::channel();
         let request = PublicationRequest {
             root,
             zone_name,
             tenant,
+            queued_at: Instant::now(),
+            timings,
             reply,
         };
         if self.sender.try_send(request).is_err() {
-            return false;
+            return Err(PublicationError::Saturated);
         }
-        response.await.unwrap_or(false)
+        response
+            .await
+            .unwrap_or(Err(PublicationError::WorkerFailed))
     }
 }
 
@@ -390,13 +468,22 @@ type SharedState = Arc<AppState>;
 /// Sous-mesures accumulées pendant une requête (auth, disque, `named-checkzone`,
 /// `rndc`…), transformées en en-tête `Server-Timing` par le middleware.
 #[derive(Clone, Default)]
-struct Timings(Arc<Mutex<Vec<(&'static str, f64)>>>);
+struct Timings {
+    entries: Arc<Mutex<Vec<(&'static str, f64, Option<String>)>>>,
+    request_id: Arc<Mutex<Option<String>>>,
+}
 
 impl Timings {
     /// Enregistre une étape en millisecondes.
     fn record(&self, step: &'static str, elapsed: std::time::Duration) {
-        if let Ok(mut steps) = self.0.lock() {
-            steps.push((step, elapsed.as_secs_f64() * 1000.0));
+        if let Ok(mut steps) = self.entries.lock() {
+            steps.push((step, elapsed.as_secs_f64() * 1000.0, None));
+        }
+    }
+
+    fn record_detail(&self, step: &'static str, detail: String) {
+        if let Ok(mut steps) = self.entries.lock() {
+            steps.push((step, 0.0, Some(detail)));
         }
     }
 
@@ -404,18 +491,28 @@ impl Timings {
     fn header_value(&self, total_ms: f64) -> String {
         let mut parts = vec![format!("app;dur={:.1};desc=\"handler\"", total_ms)];
 
-        if let Ok(steps) = self.0.lock() {
-            for (name, dur) in steps.iter() {
-                parts.push(format!(
-                    "{};dur={:.1};desc=\"{}\"",
-                    name,
-                    dur,
-                    step_label(name)
-                ));
+        if let Ok(steps) = self.entries.lock() {
+            for (name, dur, detail) in steps.iter() {
+                let desc = detail.as_deref().unwrap_or_else(|| step_label(name));
+                parts.push(format!("{};dur={:.1};desc=\"{}\"", name, dur, desc));
             }
         }
 
         parts.join(", ")
+    }
+
+    fn set_request_id(&self, request_id: String) {
+        if let Ok(mut stored) = self.request_id.lock() {
+            *stored = Some(request_id);
+        }
+    }
+
+    fn request_id(&self) -> String {
+        self.request_id
+            .lock()
+            .ok()
+            .and_then(|stored| stored.clone())
+            .unwrap_or_else(|| "unknown".into())
     }
 }
 
@@ -425,8 +522,13 @@ fn step_label(step: &str) -> &str {
         "validate" => "payload validation",
         "list" => "list zones",
         "write" => "zone file write",
+        "filesystem" => "filesystem work",
         "checkzone" => "named-checkzone",
         "rndc" => "rndc reload",
+        "publish" => "BIND publication",
+        "queue" => "publication queue wait",
+        "lock" => "zone lock wait",
+        "payload" => "request payload",
         "delete" => "delete zone",
         "token" => "token generation",
         other => other,
@@ -479,6 +581,7 @@ async fn server_timing(
     let timings = Timings::default();
     request.extensions_mut().insert(timings.clone());
     let request_id = request_id(request.headers());
+    timings.set_request_id(request_id.clone());
     let method = request.method().to_string();
     let path = request.uri().path().to_string();
     let bearer = bearer_token(request.headers()).map(str::to_owned);
@@ -678,7 +781,7 @@ fn list_zones(
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((zones, None)),
-        Err(error) => return Err(format!("read {}: {}", root.display(), error)),
+        Err(error) => return Err(format!("could not read zones directory: {}", error)),
     };
 
     for entry in entries.flatten() {
@@ -712,9 +815,30 @@ fn problem(
     detail: &str,
     instance: &str,
 ) -> axum::response::Response {
+    let code = match status {
+        StatusCode::BAD_REQUEST => "bad_request",
+        StatusCode::UNAUTHORIZED => "unauthorized",
+        StatusCode::FORBIDDEN => "forbidden",
+        StatusCode::NOT_FOUND => "not_found",
+        StatusCode::CONFLICT => "conflict",
+        StatusCode::UNPROCESSABLE_ENTITY => "validation_failed",
+        StatusCode::SERVICE_UNAVAILABLE => "service_unavailable",
+        _ => "internal_error",
+    };
+    problem_with_code(status, title, code, detail, instance)
+}
+
+fn problem_with_code(
+    status: StatusCode,
+    title: &str,
+    code: &str,
+    detail: &str,
+    instance: &str,
+) -> axum::response::Response {
     let body = ProblemDetails::new(status.as_u16(), title)
         .with_detail(detail)
-        .with_instance(instance);
+        .with_instance(instance)
+        .with_extension("code", serde_json::Value::String(code.into()));
     (status, Json(body)).into_response()
 }
 
@@ -776,15 +900,17 @@ fn zone_payload_error_response(error: ZonePayloadError, instance: &str) -> Respo
             &format!("invalid JSON body: {}", error),
         ),
         ZonePayloadError::InvalidRecords(errors) => validation_problem(&errors, instance),
-        ZonePayloadError::Saturated => problem(
+        ZonePayloadError::Saturated => problem_with_code(
             StatusCode::SERVICE_UNAVAILABLE,
             "Service Unavailable",
+            "validation_capacity_exhausted",
             "zone validation capacity is currently exhausted",
             instance,
         ),
-        ZonePayloadError::WorkerFailed => problem(
+        ZonePayloadError::WorkerFailed => problem_with_code(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Internal Server Error",
+            "validation_worker_failed",
             "zone validation worker failed",
             instance,
         ),
@@ -801,6 +927,7 @@ fn check_zone_file(zone_name: &str, zone_file: &Path) -> Result<(), validation::
     validation::validate_zone_file_with_named_checkzone(zone_name, zone_file)
 }
 
+#[derive(Debug)]
 enum ZoneWriteError {
     Io(String),
     Validation(validation::ValidationError),
@@ -813,14 +940,26 @@ struct ZoneWriteOutcome {
     serial: i32,
 }
 
-/// La cible n'est remplacée qu'après validation du fichier temporaire. Le Drop
-/// du temporaire le nettoie automatiquement sur tout échec.
-fn write_zone_transaction(
+fn write_zone_transaction_timed(
     root: &Path,
     zone_name: &str,
     records: &[validation::ValidatedRecord],
+    timings: &Timings,
 ) -> Result<(bool, i32), ZoneWriteError> {
-    write_zone_transaction_with(root, zone_name, records, check_zone_file)
+    let start = Instant::now();
+    let mut checkzone_elapsed = std::time::Duration::ZERO;
+    let result = write_zone_transaction_with(root, zone_name, records, |name, path| {
+        let checkzone_start = Instant::now();
+        let result = check_zone_file(name, path);
+        checkzone_elapsed = checkzone_start.elapsed();
+        result
+    });
+    timings.record("checkzone", checkzone_elapsed);
+    timings.record(
+        "filesystem",
+        start.elapsed().saturating_sub(checkzone_elapsed),
+    );
+    result
 }
 
 fn write_zone_transaction_with(
@@ -864,21 +1003,39 @@ fn write_zone_work(
     zone_name: &str,
     records: &[validation::ValidatedRecord],
     tenant: &str,
+    timings: &Timings,
 ) -> Result<ZoneWriteOutcome, ZoneWriteError> {
-    let owners_dir = zone_owners_dir();
+    write_zone_work_with_owners(
+        root,
+        zone_name,
+        records,
+        tenant,
+        timings,
+        &zone_owners_dir(),
+    )
+}
+
+fn write_zone_work_with_owners(
+    root: &Path,
+    zone_name: &str,
+    records: &[validation::ValidatedRecord],
+    tenant: &str,
+    timings: &Timings,
+    owners_dir: &Path,
+) -> Result<ZoneWriteOutcome, ZoneWriteError> {
     let claim =
-        bind::claim_zone_owner(&owners_dir, zone_name, tenant).map_err(|error| match error {
+        bind::claim_zone_owner(owners_dir, zone_name, tenant).map_err(|error| match error {
             bind::OwnerError::Conflict => ZoneWriteError::OwnerConflict,
             bind::OwnerError::Io => ZoneWriteError::OwnerIo,
         })?;
 
-    let (created, serial) = match write_zone_transaction(root, zone_name, records) {
+    let (created, serial) = match write_zone_transaction_timed(root, zone_name, records, timings) {
         Ok(result) => result,
         Err(error) => {
             if claim.created {
-                if let Err(release_error) = bind::release_zone_owner(&owners_dir, zone_name, tenant)
+                if let Err(release_error) = bind::release_zone_owner(owners_dir, zone_name, tenant)
                 {
-                    tracing::warn!("could not release failed zone claim: {:?}", release_error);
+                    tracing::warn!(request_id = %timings.request_id(), error = ?release_error, "could not release failed zone claim");
                 }
             }
             return Err(error);
@@ -897,7 +1054,9 @@ fn sync_existing_zone_work(
     root: &Path,
     zone_name: &str,
     tenant: &str,
+    timings: &Timings,
 ) -> Result<i32, ZoneSyncError> {
+    let filesystem_start = Instant::now();
     let zone_file = zone::zone_file_path(root, zone_name);
     let contents = match fs::read_to_string(&zone_file) {
         Ok(contents) => contents,
@@ -920,6 +1079,7 @@ fn sync_existing_zone_work(
             bind::OwnerError::Io => ZoneWriteError::OwnerIo,
         })
     })?;
+    timings.record("filesystem", filesystem_start.elapsed());
     Ok(serial)
 }
 
@@ -936,7 +1096,9 @@ fn delete_zone_work(
     zone_name: &str,
     tenant: &str,
     rndc: &RndcClient,
+    timings: &Timings,
 ) -> Result<Option<bool>, ZoneDeleteError> {
+    let filesystem_start = Instant::now();
     let zone_path = root.join(zone_name);
     if !zone_path.is_dir() {
         return Err(ZoneDeleteError::NotFound);
@@ -949,8 +1111,11 @@ fn delete_zone_work(
             bind::OwnerError::Io => ZoneDeleteError::OwnerIo,
         })?;
     if claim.state != bind::OwnerState::Inactive {
-        rndc.delete_zone(zone_name).map_err(|error| {
-            tracing::warn!("BIND deletion failed for {}: {:?}", zone_name, error);
+        let rndc_start = Instant::now();
+        let deletion = rndc.delete_zone(zone_name);
+        timings.record("rndc", rndc_start.elapsed());
+        deletion.map_err(|error| {
+            tracing::warn!(request_id = %timings.request_id(), zone = %zone_name, error = ?error, "BIND deletion failed");
             ZoneDeleteError::Bind(error)
         })?;
         bind::set_zone_owner_state(&owners_dir, zone_name, tenant, bind::OwnerState::Inactive)
@@ -959,6 +1124,10 @@ fn delete_zone_work(
     fs::remove_dir_all(&zone_path).map_err(ZoneDeleteError::Io)?;
     bind::release_zone_owner(&owners_dir, zone_name, tenant)
         .map_err(|_| ZoneDeleteError::OwnerIo)?;
+    timings.record(
+        "filesystem",
+        Instant::now().saturating_duration_since(filesystem_start),
+    );
 
     Ok(Some(false))
 }
@@ -1083,25 +1252,28 @@ async fn handle_list_zones(
     .await;
     match result {
         Err(BlockingWorkError::Saturated) => {
-            return problem(
+            return problem_with_code(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Service Unavailable",
+                "capacity_exhausted",
                 "I/O capacity is exhausted",
                 "/zones",
             )
         }
         Err(BlockingWorkError::WorkerFailed) => {
-            return problem(
+            return problem_with_code(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal Server Error",
+                "worker_failed",
                 "I/O worker failed",
                 "/zones",
             )
         }
         Ok(Err(error)) => {
-            return problem(
+            return problem_with_code(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal Server Error",
+                "filesystem_error",
                 &error,
                 "/zones",
             )
@@ -1151,6 +1323,7 @@ async fn handle_put_zone(
         Err(error) => return validation_problem(&[error], &instance),
     };
 
+    let payload_bytes = body.len();
     let payload_result = timed_async(
         &timings,
         "validate",
@@ -1165,14 +1338,19 @@ async fn handle_put_zone(
         Ok(payload) => payload,
         Err(error) => return zone_payload_error_response(error, &instance),
     };
+    timings.record_detail(
+        "payload",
+        format!("bytes={};records={}", payload_bytes, payload.len()),
+    );
 
     let root = zone_root(&user);
-    let zone_guard = lock_zone(&state, zone_lock_key(&zone_name)).await;
+    let zone_guard = lock_zone(&state, zone_lock_key(&zone_name), &timings).await;
     let user_for_work = user.clone();
     let name_for_work = zone_name.clone();
     let tenant = zone_owner_id(&user);
     let tenant_for_work = tenant.clone();
     let root_for_work = root.clone();
+    let timings_for_work = timings.clone();
     let write_result = timed_async(
         &timings,
         "write",
@@ -1184,32 +1362,41 @@ async fn handle_put_zone(
             move || {
                 let _zone_guard = zone_guard;
                 migrate_legacy_zone_root(&user_for_work, &root_for_work);
-                write_zone_work(&root_for_work, &name_for_work, &payload, &tenant_for_work)
+                write_zone_work(
+                    &root_for_work,
+                    &name_for_work,
+                    &payload,
+                    &tenant_for_work,
+                    &timings_for_work,
+                )
             },
         ),
     )
     .await;
     let outcome = match write_result {
         Err(BlockingWorkError::Saturated) => {
-            return problem(
+            return problem_with_code(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Service Unavailable",
+                "capacity_exhausted",
                 "I/O capacity is exhausted",
                 &instance,
             )
         }
         Err(BlockingWorkError::WorkerFailed) => {
-            return problem(
+            return problem_with_code(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal Server Error",
+                "worker_failed",
                 "I/O worker failed",
                 &instance,
             )
         }
         Ok(Err(ZoneWriteError::Io(error))) => {
-            return problem(
+            return problem_with_code(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal Server Error",
+                "filesystem_error",
                 &error,
                 &instance,
             )
@@ -1226,9 +1413,10 @@ async fn handle_put_zone(
             )
         }
         Ok(Err(ZoneWriteError::OwnerIo)) => {
-            return problem(
+            return problem_with_code(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal Server Error",
+                "ownership_error",
                 "zone ownership could not be read or updated",
                 &instance,
             )
@@ -1241,17 +1429,22 @@ async fn handle_put_zone(
     } else {
         (StatusCode::OK, "updated")
     };
-    let active = state
-        .publications
-        .publish(root, zone_name.clone(), tenant)
-        .await;
+    let activation = timed_async(
+        &timings,
+        "publish",
+        state
+            .publications
+            .publish(root, zone_name.clone(), tenant, timings.clone()),
+    )
+    .await;
 
     (
         code,
         Json(SyncResponse {
             status: status.into(),
             persisted: true,
-            active: Some(active),
+            active: Some(activation.is_ok()),
+            activation_error: activation.err().map(|error| error.code().to_string()),
             zone: zone_name,
             serial: outcome.serial.to_string(),
             scope: scope_of(&user),
@@ -1294,31 +1487,34 @@ async fn handle_delete_zone(
     };
 
     let root = zone_root(&user);
-    let zone_guard = lock_zone(&state, zone_lock_key(&zone_name)).await;
+    let zone_guard = lock_zone(&state, zone_lock_key(&zone_name), &timings).await;
     let user_for_work = user.clone();
     let name_for_work = zone_name.clone();
     let tenant = zone_owner_id(&user);
     let rndc = state.rndc.clone();
+    let timings_for_work = timings.clone();
     let deletion = timed_async(
         &timings,
         "delete",
         run_limited(Arc::clone(&state.io_slots), move || {
             let _zone_guard = zone_guard;
             migrate_legacy_zone_root(&user_for_work, &root);
-            delete_zone_work(&root, &name_for_work, &tenant, &rndc)
+            delete_zone_work(&root, &name_for_work, &tenant, &rndc, &timings_for_work)
         }),
     )
     .await;
     match deletion {
-        Err(BlockingWorkError::Saturated) => problem(
+        Err(BlockingWorkError::Saturated) => problem_with_code(
             StatusCode::SERVICE_UNAVAILABLE,
             "Service Unavailable",
+            "capacity_exhausted",
             "I/O capacity is exhausted",
             &instance,
         ),
-        Err(BlockingWorkError::WorkerFailed) => problem(
+        Err(BlockingWorkError::WorkerFailed) => problem_with_code(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Internal Server Error",
+            "worker_failed",
             "I/O worker failed",
             &instance,
         ),
@@ -1337,21 +1533,27 @@ async fn handle_delete_zone(
             "zone name is owned by another tenant",
             &instance,
         ),
-        Ok(Err(ZoneDeleteError::OwnerIo)) => problem(
+        Ok(Err(ZoneDeleteError::OwnerIo)) => problem_with_code(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Internal Server Error",
+            "ownership_error",
             "zone ownership could not be read or updated",
             &instance,
         ),
-        Ok(Err(ZoneDeleteError::Bind(_error))) => problem(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Service Unavailable",
-            "BIND could not remove the zone; zone files remain available for retry",
-            &instance,
-        ),
-        Ok(Err(ZoneDeleteError::Io(error))) => problem(
+        Ok(Err(ZoneDeleteError::Bind(error))) => {
+            let code = PublicationError::Rndc(error).code();
+            problem_with_code(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable",
+                code,
+                "BIND could not remove the zone; zone files remain available for retry",
+                &instance,
+            )
+        }
+        Ok(Err(ZoneDeleteError::Io(error))) => problem_with_code(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Internal Server Error",
+            "filesystem_error",
             &format!("failed to delete zone: {}", error),
             &instance,
         ),
@@ -1391,6 +1593,7 @@ async fn handle_sync(
         Err(error) => return auth_problem(error, INSTANCE),
     };
 
+    let payload_bytes = body.len();
     let payload = if body.is_empty() {
         None
     } else {
@@ -1409,6 +1612,12 @@ async fn handle_sync(
             Err(error) => return zone_payload_error_response(error, INSTANCE),
         }
     };
+    if let Some(records) = &payload {
+        timings.record_detail(
+            "payload",
+            format!("bytes={};records={}", payload_bytes, records.len()),
+        );
+    }
 
     if payload.is_none() && query.zone.is_none() {
         return err(
@@ -1423,12 +1632,13 @@ async fn handle_sync(
     };
 
     let root = zone_root(&user);
-    let zone_guard = lock_zone(&state, zone_lock_key(&zone_name)).await;
+    let zone_guard = lock_zone(&state, zone_lock_key(&zone_name), &timings).await;
     let user_for_work = user.clone();
     let name_for_work = zone_name.clone();
     let tenant = zone_owner_id(&user);
     let root_for_work = root.clone();
     let tenant_for_work = tenant.clone();
+    let timings_for_work = timings.clone();
     let serial_result = timed_async(
         &timings,
         "write",
@@ -1441,15 +1651,22 @@ async fn handle_sync(
                 let _zone_guard = zone_guard;
                 migrate_legacy_zone_root(&user_for_work, &root_for_work);
                 match payload {
-                    Some(records) => {
-                        write_zone_work(&root_for_work, &name_for_work, &records, &tenant_for_work)
-                            .map(|outcome| Some(outcome.serial))
-                            .map_err(ZoneSyncError::Zone)
-                    }
-                    None => {
-                        sync_existing_zone_work(&root_for_work, &name_for_work, &tenant_for_work)
-                            .map(Some)
-                    }
+                    Some(records) => write_zone_work(
+                        &root_for_work,
+                        &name_for_work,
+                        &records,
+                        &tenant_for_work,
+                        &timings_for_work,
+                    )
+                    .map(|outcome| Some(outcome.serial))
+                    .map_err(ZoneSyncError::Zone),
+                    None => sync_existing_zone_work(
+                        &root_for_work,
+                        &name_for_work,
+                        &tenant_for_work,
+                        &timings_for_work,
+                    )
+                    .map(Some),
                 }
             },
         ),
@@ -1457,25 +1674,28 @@ async fn handle_sync(
     .await;
     let serial = match serial_result {
         Err(BlockingWorkError::Saturated) => {
-            return problem(
+            return problem_with_code(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Service Unavailable",
+                "capacity_exhausted",
                 "I/O capacity is exhausted",
                 INSTANCE,
             )
         }
         Err(BlockingWorkError::WorkerFailed) => {
-            return problem(
+            return problem_with_code(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal Server Error",
+                "worker_failed",
                 "I/O worker failed",
                 INSTANCE,
             )
         }
         Ok(Err(ZoneSyncError::Zone(ZoneWriteError::Io(error)))) => {
-            return problem(
+            return problem_with_code(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal Server Error",
+                "filesystem_error",
                 &error,
                 INSTANCE,
             )
@@ -1492,9 +1712,10 @@ async fn handle_sync(
             )
         }
         Ok(Err(ZoneSyncError::Zone(ZoneWriteError::OwnerIo))) => {
-            return problem(
+            return problem_with_code(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal Server Error",
+                "ownership_error",
                 "zone ownership could not be read or updated",
                 INSTANCE,
             )
@@ -1514,15 +1735,25 @@ async fn handle_sync(
         }
     };
 
-    let active = state
-        .publications
-        .publish(root, zone_name.clone(), tenant)
-        .await;
+    let activation = timed_async(
+        &timings,
+        "publish",
+        state
+            .publications
+            .publish(root, zone_name.clone(), tenant, timings.clone()),
+    )
+    .await;
 
     Json(SyncResponse {
-        status: if active { "reloaded" } else { "persisted" }.into(),
+        status: if activation.is_ok() {
+            "reloaded"
+        } else {
+            "persisted"
+        }
+        .into(),
         persisted: true,
-        active: Some(active),
+        active: Some(activation.is_ok()),
+        activation_error: activation.err().map(|error| error.code().to_string()),
         zone: zone_name,
         serial: serial.to_string(),
         scope: scope_of(&user),
@@ -1606,17 +1837,19 @@ async fn handle_token(
     .await;
     let stored = match update {
         Err(BlockingWorkError::Saturated) => {
-            return problem(
+            return problem_with_code(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Service Unavailable",
+                "capacity_exhausted",
                 "I/O capacity is exhausted",
                 "/token",
             )
         }
         Err(BlockingWorkError::WorkerFailed) => {
-            return problem(
+            return problem_with_code(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal Server Error",
+                "worker_failed",
                 "I/O worker failed",
                 "/token",
             )
@@ -1693,6 +1926,11 @@ async fn main() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    if let Err(error) = validation::configure_checkzone_timeout_from_env() {
+        eprintln!("checkzone config: {}", error);
+        std::process::exit(1);
+    }
 
     let request_limits = match RequestLimits::from_env() {
         Ok(limits) => limits,
@@ -1801,6 +2039,13 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("squilladns-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
     #[test]
     fn zone_listing_is_sorted_and_paged_with_a_bounded_page() {
         let root = std::env::temp_dir().join(format!("squilladns-list-{}", std::process::id()));
@@ -1846,6 +2091,18 @@ mod tests {
     }
 
     #[test]
+    fn server_timing_exposes_lock_process_and_payload_metrics() {
+        let timings = Timings::default();
+        timings.record("lock", Duration::from_millis(2));
+        timings.record("rndc", Duration::from_millis(4));
+        timings.record_detail("payload", "bytes=128;records=3".into());
+        let header = timings.header_value(12.0);
+        assert!(header.contains("lock;dur=2.0;desc=\"zone lock wait\""));
+        assert!(header.contains("rndc;dur=4.0;desc=\"rndc reload\""));
+        assert!(header.contains("payload;dur=0.0;desc=\"bytes=128;records=3\""));
+    }
+
+    #[test]
     fn request_id_reuses_client_value_and_rejects_junk() {
         let mut headers = HeaderMap::new();
         assert_eq!(request_id(&headers).len(), 16, "id généré = 8 octets hex");
@@ -1867,6 +2124,7 @@ mod tests {
             status: "created".into(),
             persisted: true,
             active: None,
+            activation_error: None,
             zone: "example.test".into(),
             serial: "1".into(),
             scope: "public".into(),
@@ -1879,6 +2137,7 @@ mod tests {
             status: "synced".into(),
             persisted: true,
             active: Some(false),
+            activation_error: Some("rndc_timeout".into()),
             zone: "example.test".into(),
             serial: "2".into(),
             scope: "public".into(),
@@ -1886,6 +2145,160 @@ mod tests {
         let sync_json = serde_json::to_value(sync_response).unwrap();
         assert_eq!(sync_json["persisted"], true);
         assert_eq!(sync_json["active"], false);
+        assert_eq!(sync_json["activation_error"], "rndc_timeout");
+    }
+
+    #[tokio::test]
+    async fn problem_details_include_a_stable_machine_error_code() {
+        let response = problem_with_code(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal Server Error",
+            "filesystem_error",
+            "zone storage failed",
+            "/zones/example.test",
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], "filesystem_error");
+        assert_eq!(body["detail"], "zone storage failed");
+        assert!(!body.to_string().contains("/private/"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_zone_writes_get_distinct_serials_and_complete_files() {
+        let root = temp_test_dir("same-zone-writes");
+        let locks = ZoneLocks::default();
+        let records = vec![validation::validate_record(&Record {
+            record_type: "A".into(),
+            name: "www".into(),
+            value: "192.0.2.8".into(),
+        })
+        .unwrap()];
+
+        let run_write =
+            |locks: ZoneLocks, root: PathBuf, records: Vec<validation::ValidatedRecord>| {
+                tokio::spawn(async move {
+                    let _guard = locks.lock("shared-zone".into()).await;
+                    tokio::task::spawn_blocking(move || {
+                        write_zone_transaction_timed(
+                            &root,
+                            "example.test",
+                            &records,
+                            &Timings::default(),
+                        )
+                    })
+                    .await
+                    .unwrap()
+                })
+            };
+        let first = run_write(locks.clone(), root.clone(), records.clone());
+        let second = run_write(locks, root.clone(), records);
+        let (first, second) = tokio::join!(first, second);
+        let first_serial = first.unwrap().unwrap().1;
+        let second_serial = second.unwrap().unwrap().1;
+        assert_ne!(first_serial, second_serial);
+
+        let zone_file = zone::zone_file_path(&root, "example.test");
+        let contents = fs::read_to_string(&zone_file).unwrap();
+        assert_eq!(
+            zone::serial_from_contents(&contents),
+            Some(first_serial.max(second_serial))
+        );
+        assert_eq!(contents.matches("www 3600 IN A").count(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn every_supported_rr_is_rendered_once_with_its_typed_value() {
+        let input = [
+            ("A", "www", "192.0.2.9"),
+            ("AAAA", "v6", "2001:db8::9"),
+            ("CNAME", "alias", "www.example.test."),
+            ("MX", "@", "10 mail.example.test."),
+            ("NS", "@", "ns.example.test."),
+            ("TXT", "txt", "hello"),
+            ("SRV", "_sip._tcp", "0 5 5060 sip.example.test."),
+            ("CAA", "@", "0 issue \"letsencrypt.org\""),
+        ];
+        let records: Vec<_> = input
+            .iter()
+            .map(|(record_type, name, value)| {
+                validation::validate_record(&Record {
+                    record_type: (*record_type).into(),
+                    name: (*name).into(),
+                    value: (*value).into(),
+                })
+                .unwrap()
+            })
+            .collect();
+
+        let rendered = zone::render_zone_file("example.test", &records, 42);
+        let root = temp_test_dir("typed-rr-file");
+        let zone_file = zone::prepare_zone_file("example.test", &rendered, &root)
+            .unwrap()
+            .publish()
+            .unwrap();
+        let contents = fs::read_to_string(zone_file).unwrap();
+        for (record_type, _, _) in input {
+            assert_eq!(
+                contents
+                    .lines()
+                    .filter(|line| line.contains(&format!(" IN {} ", record_type)))
+                    .count(),
+                1,
+                "expected exactly one {} record",
+                record_type
+            );
+        }
+        assert!(contents.contains("www 3600 IN A 192.0.2.9"));
+        assert!(contents.contains("v6 3600 IN AAAA 2001:db8::9"));
+        assert!(contents.contains("alias 3600 IN CNAME www.example.test."));
+        assert!(contents.contains("@ 3600 IN MX 10 mail.example.test."));
+        assert!(contents.contains("@ 3600 IN NS ns.example.test."));
+        assert!(contents.contains("txt 3600 IN TXT \"hello\""));
+        assert!(contents.contains("_sip._tcp 3600 IN SRV 0 5 5060 sip.example.test."));
+        assert!(contents.contains("@ 3600 IN CAA 0 issue \"letsencrypt.org\""));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rndc_activation_failure_keeps_a_recoverable_pending_owner_state() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_test_dir("activation-failure");
+        let owners = root.join("owners");
+        let zone_file = root.join("example.test.zone");
+        let rndc_script = root.join("rndc-fails");
+        fs::write(&zone_file, "zone contents").unwrap();
+        fs::write(&rndc_script, "#!/bin/sh\nexit 7\n").unwrap();
+        let mut permissions = fs::metadata(&rndc_script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&rndc_script, permissions).unwrap();
+        bind::claim_zone_owner(&owners, "example.test", "tenant-a").unwrap();
+        let rndc = RndcClient::new(rndc_script, None, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(
+            activate_owned_zone(
+                &rndc,
+                &owners,
+                "example.test",
+                "tenant-a",
+                zone_file.to_str().unwrap(),
+                bind::OwnerState::Inactive,
+                &[],
+            ),
+            Err(PublicationError::Rndc(RndcError::CommandFailed(Some(7))))
+        );
+        assert_eq!(
+            bind::read_zone_owner(&owners, "example.test")
+                .unwrap()
+                .unwrap()
+                .state,
+            bind::OwnerState::Activating
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

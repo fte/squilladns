@@ -31,6 +31,7 @@ pub fn zone_file_path(zone_dir: &Path, zone_name: &str) -> PathBuf {
 }
 
 /// Lit le serial actuel d'un fichier de zone (champ 3 de la ligne SOA).
+#[cfg(test)]
 pub fn read_serial(zone_file: &Path) -> Option<i32> {
     let content = std::fs::read_to_string(zone_file).ok()?;
     serial_from_contents(&content)
