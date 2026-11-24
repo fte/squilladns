@@ -2,9 +2,7 @@ mod auth;
 mod validation;
 mod zone;
 
-use squilladns::request_limits::{
-    body_limit, parse_max_request_body_bytes, ENV_MAX_REQUEST_BODY_BYTES,
-};
+use squilladns::request_limits::{body_limit, RequestLimits};
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -27,7 +25,7 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
 use auth::{AuthError, AuthUser, JwtConfig, TokenStore};
-use validation::{validate_zone_payload, ProblemDetails, ValidationErrorCode};
+use validation::{ProblemDetails, ValidationErrorCode};
 
 const VERSION: &str = "0.1.0";
 
@@ -175,6 +173,7 @@ pub struct ZonePayload {
 struct AppState {
     tokens: Mutex<TokenStore>,
     jwt: Option<JwtConfig>,
+    request_limits: RequestLimits,
     /// Identité imposée par `SANDBOX_USER` (mode dev).
     sandbox: Option<AuthUser>,
 }
@@ -707,6 +706,7 @@ async fn handle_list_zones(
     security(("bearer_token" = []))
 )]
 async fn handle_put_zone(
+    State(state): State<SharedState>,
     Extension(caller): Extension<CallerResolution>,
     Extension(timings): Extension<Timings>,
     UrlPath(name): UrlPath<String>,
@@ -723,7 +723,9 @@ async fn handle_put_zone(
         Err(error) => return validation_problem(&[error], &instance),
     };
 
-    if let Err(errors) = timed(&timings, "validate", || validate_zone_payload(&payload)) {
+    if let Err(errors) = timed(&timings, "validate", || {
+        validation::validate_zone_payload_with_limits(&payload, &state.request_limits)
+    }) {
         return validation_problem(&errors, &instance);
     }
 
@@ -837,6 +839,7 @@ async fn handle_delete_zone(
     security(("bearer_token" = []))
 )]
 async fn handle_sync(
+    State(state): State<SharedState>,
     Extension(caller): Extension<CallerResolution>,
     Extension(timings): Extension<Timings>,
     Query(query): Query<SyncQuery>,
@@ -880,7 +883,9 @@ async fn handle_sync(
 
     let serial = match payload {
         Some(payload) => {
-            if let Err(errors) = timed(&timings, "validate", || validate_zone_payload(&payload)) {
+            if let Err(errors) = timed(&timings, "validate", || {
+                validation::validate_zone_payload_with_limits(&payload, &state.request_limits)
+            }) {
                 return validation_problem(&errors, INSTANCE);
             }
 
@@ -1058,12 +1063,10 @@ async fn main() {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let max_request_body_bytes = match parse_max_request_body_bytes(
-        std::env::var(ENV_MAX_REQUEST_BODY_BYTES).ok().as_deref(),
-    ) {
-        Ok(limit) => limit,
+    let request_limits = match RequestLimits::from_env() {
+        Ok(limits) => limits,
         Err(error) => {
-            eprintln!("request limit config: {}", error);
+            eprintln!("request limits config: {}", error);
             std::process::exit(1);
         }
     };
@@ -1096,6 +1099,7 @@ async fn main() {
     let state = Arc::new(AppState {
         tokens: Mutex::new(tokens),
         jwt,
+        request_limits,
         sandbox,
     });
 
@@ -1111,7 +1115,7 @@ async fn main() {
         )
         .route("/sync", post(handle_sync))
         .route("/token", post(handle_token))
-        .layer(body_limit(max_request_body_bytes))
+        .layer(body_limit(request_limits.max_request_body_bytes))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             server_timing,

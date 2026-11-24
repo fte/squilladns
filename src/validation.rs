@@ -1,3 +1,4 @@
+use squilladns::request_limits::RequestLimits;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::process::Command;
@@ -104,6 +105,8 @@ pub enum ValidationErrorCode {
     EmptyLabel,
     /// Invalid TTL value
     InvalidTtl,
+    /// Zone payload exceeds configured resource limits
+    ResourceLimitExceeded,
 }
 
 impl ValidationErrorCode {
@@ -126,11 +129,13 @@ impl ValidationErrorCode {
             Self::LabelTooLong => "Label Too Long",
             Self::EmptyLabel => "Empty Label",
             Self::InvalidTtl => "Invalid TTL",
+            Self::ResourceLimitExceeded => "Payload Limit Exceeded",
         }
     }
 
     pub fn status_code(&self) -> u16 {
         match self {
+            Self::ResourceLimitExceeded => 413,
             Self::UnsupportedRecordType => 400,
             Self::ZoneValidationFailed => 422,
             _ => 400,
@@ -514,10 +519,56 @@ pub fn validate_record(record: &crate::Record) -> Result<(), ValidationError> {
 }
 
 /// Validates all records in a zone payload
-pub fn validate_zone_payload(payload: &crate::ZonePayload) -> Result<(), Vec<ValidationError>> {
+pub fn validate_zone_payload_with_limits(
+    payload: &crate::ZonePayload,
+    limits: &RequestLimits,
+) -> Result<(), Vec<ValidationError>> {
+    if payload.records.len() > limits.max_records_per_zone {
+        return Err(vec![ValidationError::new(
+            ValidationErrorCode::ResourceLimitExceeded,
+            format!(
+                "Zone has {} records; maximum is {}",
+                payload.records.len(),
+                limits.max_records_per_zone
+            ),
+        )
+        .with_field("records")]);
+    }
+
     let mut errors = Vec::new();
 
     for (idx, record) in payload.records.iter().enumerate() {
+        let mut exceeded_limit = false;
+        if record.name.len() > limits.max_record_name_bytes {
+            errors.push(
+                ValidationError::new(
+                    ValidationErrorCode::ResourceLimitExceeded,
+                    format!(
+                        "Record name exceeds configured limit of {} bytes",
+                        limits.max_record_name_bytes
+                    ),
+                )
+                .with_field(&format!("records[{}].name", idx)),
+            );
+            exceeded_limit = true;
+        }
+        if record.value.len() > limits.max_record_value_bytes {
+            errors.push(
+                ValidationError::new(
+                    ValidationErrorCode::ResourceLimitExceeded,
+                    format!(
+                        "Record value exceeds configured limit of {} bytes",
+                        limits.max_record_value_bytes
+                    ),
+                )
+                .with_field(&format!("records[{}].value", idx)),
+            );
+            exceeded_limit = true;
+        }
+        if exceeded_limit {
+            continue;
+        }
+
         if let Err(e) = validate_record(record) {
             let mut err = e.with_field(&format!("records[{}]", idx));
             if err.value.is_none() {
@@ -676,5 +727,65 @@ mod tests {
             value: "invalid".to_string(),
         };
         assert!(validate_record(&record).is_err());
+    }
+
+    #[test]
+    fn zone_payload_enforces_record_count_limit() {
+        let payload = crate::ZonePayload {
+            records: vec![
+                crate::Record {
+                    record_type: "A".into(),
+                    name: "www".into(),
+                    value: "192.0.2.1".into(),
+                },
+                crate::Record {
+                    record_type: "A".into(),
+                    name: "api".into(),
+                    value: "192.0.2.2".into(),
+                },
+            ],
+        };
+        let limits = RequestLimits {
+            max_records_per_zone: 1,
+            ..RequestLimits::default()
+        };
+
+        let errors = validate_zone_payload_with_limits(&payload, &limits).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code, ValidationErrorCode::ResourceLimitExceeded);
+        assert_eq!(errors[0].field.as_deref(), Some("records"));
+    }
+
+    #[test]
+    fn zone_payload_enforces_name_and_value_byte_limits() {
+        let valid_at_limits = crate::ZonePayload {
+            records: vec![crate::Record {
+                record_type: "A".into(),
+                name: "www".into(),
+                value: "192.0.2.1".into(),
+            }],
+        };
+        let limits = RequestLimits {
+            max_record_name_bytes: 3,
+            max_record_value_bytes: 9,
+            ..RequestLimits::default()
+        };
+        assert!(validate_zone_payload_with_limits(&valid_at_limits, &limits).is_ok());
+
+        let oversized = crate::ZonePayload {
+            records: vec![crate::Record {
+                record_type: "A".into(),
+                name: "wwwx".into(),
+                value: "192.0.2.10".into(),
+            }],
+        };
+        let errors = validate_zone_payload_with_limits(&oversized, &limits).unwrap_err();
+        assert_eq!(errors.len(), 2);
+        assert!(errors
+            .iter()
+            .all(|error| error.code == ValidationErrorCode::ResourceLimitExceeded));
+        assert_eq!(errors[0].field.as_deref(), Some("records[0].name"));
+        assert_eq!(errors[1].field.as_deref(), Some("records[0].value"));
+        assert!(errors.iter().all(|error| error.value.is_none()));
     }
 }

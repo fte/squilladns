@@ -22,6 +22,12 @@ PORT     := 8085
 # Vide = un token est généré, écrit dans .state/tokens et affiché dans les logs.
 API_TOKEN ?=
 
+# Limites des requêtes et RR (surchargeables via make up MAX_RECORDS_PER_ZONE=...)
+MAX_REQUEST_BODY_BYTES ?= 1048576
+MAX_RECORDS_PER_ZONE ?= 10000
+MAX_RECORD_NAME_BYTES ?= 253
+MAX_RECORD_VALUE_BYTES ?= 4096
+
 # Verbosité des logs (surchargeable : make up RUST_LOG=debug)
 RUST_LOG ?= info
 
@@ -146,6 +152,10 @@ ifeq ($(RUNTIME_EFFECTIVE),container)
 	  --volume $(CURDIR)/.state:/app/state \
 	  --env API_TOKEN_PATH=/app/state/tokens \
 	  --env API_TOKEN=$(API_TOKEN) \
+	  --env MAX_REQUEST_BODY_BYTES=$(MAX_REQUEST_BODY_BYTES) \
+	  --env MAX_RECORDS_PER_ZONE=$(MAX_RECORDS_PER_ZONE) \
+	  --env MAX_RECORD_NAME_BYTES=$(MAX_RECORD_NAME_BYTES) \
+	  --env MAX_RECORD_VALUE_BYTES=$(MAX_RECORD_VALUE_BYTES) \
 	  --env RUST_LOG=$(RUST_LOG) \
 	  --env JWT_SECRET=$(JWT_SECRET) \
 	  --env JWT_ED25519_PUBLIC_KEY=$(JWT_ED25519_PUBLIC_KEY) \

@@ -1,20 +1,91 @@
 use axum::extract::DefaultBodyLimit;
 
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_MAX_RECORDS_PER_ZONE: usize = 10_000;
+pub const DEFAULT_MAX_RECORD_NAME_BYTES: usize = 253;
+pub const DEFAULT_MAX_RECORD_VALUE_BYTES: usize = 4096;
 pub const ENV_MAX_REQUEST_BODY_BYTES: &str = "MAX_REQUEST_BODY_BYTES";
+pub const ENV_MAX_RECORDS_PER_ZONE: &str = "MAX_RECORDS_PER_ZONE";
+pub const ENV_MAX_RECORD_NAME_BYTES: &str = "MAX_RECORD_NAME_BYTES";
+pub const ENV_MAX_RECORD_VALUE_BYTES: &str = "MAX_RECORD_VALUE_BYTES";
 
-pub fn parse_max_request_body_bytes(value: Option<&str>) -> Result<usize, String> {
+#[derive(Debug, Clone, Copy)]
+pub struct RequestLimits {
+    pub max_request_body_bytes: usize,
+    pub max_records_per_zone: usize,
+    pub max_record_name_bytes: usize,
+    pub max_record_value_bytes: usize,
+}
+
+impl Default for RequestLimits {
+    fn default() -> Self {
+        Self {
+            max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
+            max_records_per_zone: DEFAULT_MAX_RECORDS_PER_ZONE,
+            max_record_name_bytes: DEFAULT_MAX_RECORD_NAME_BYTES,
+            max_record_value_bytes: DEFAULT_MAX_RECORD_VALUE_BYTES,
+        }
+    }
+}
+
+impl RequestLimits {
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_values(
+            env_value(ENV_MAX_REQUEST_BODY_BYTES)?,
+            env_value(ENV_MAX_RECORDS_PER_ZONE)?,
+            env_value(ENV_MAX_RECORD_NAME_BYTES)?,
+            env_value(ENV_MAX_RECORD_VALUE_BYTES)?,
+        )
+    }
+
+    pub fn from_values(
+        max_request_body_bytes: Option<String>,
+        max_records_per_zone: Option<String>,
+        max_record_name_bytes: Option<String>,
+        max_record_value_bytes: Option<String>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            max_request_body_bytes: parse_limit(
+                ENV_MAX_REQUEST_BODY_BYTES,
+                max_request_body_bytes.as_deref(),
+                DEFAULT_MAX_REQUEST_BODY_BYTES,
+            )?,
+            max_records_per_zone: parse_limit(
+                ENV_MAX_RECORDS_PER_ZONE,
+                max_records_per_zone.as_deref(),
+                DEFAULT_MAX_RECORDS_PER_ZONE,
+            )?,
+            max_record_name_bytes: parse_limit(
+                ENV_MAX_RECORD_NAME_BYTES,
+                max_record_name_bytes.as_deref(),
+                DEFAULT_MAX_RECORD_NAME_BYTES,
+            )?,
+            max_record_value_bytes: parse_limit(
+                ENV_MAX_RECORD_VALUE_BYTES,
+                max_record_value_bytes.as_deref(),
+                DEFAULT_MAX_RECORD_VALUE_BYTES,
+            )?,
+        })
+    }
+}
+
+fn env_value(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{} must be valid UTF-8", name)),
+    }
+}
+
+fn parse_limit(name: &str, value: Option<&str>, default: usize) -> Result<usize, String> {
     let Some(value) = value else {
-        return Ok(DEFAULT_MAX_REQUEST_BODY_BYTES);
+        return Ok(default);
     };
     let limit = value
         .parse::<usize>()
-        .map_err(|_| format!("{} must be a positive integer", ENV_MAX_REQUEST_BODY_BYTES))?;
+        .map_err(|_| format!("{} must be a positive integer", name))?;
     if limit == 0 {
-        return Err(format!(
-            "{} must be greater than zero",
-            ENV_MAX_REQUEST_BODY_BYTES
-        ));
+        return Err(format!("{} must be greater than zero", name));
     }
     Ok(limit)
 }
