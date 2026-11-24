@@ -221,15 +221,31 @@ endif
 test: ## Lance tous les tests (cargo test)
 	cargo test -- --nocapture
 
-test-list: ## Liste tous les tests disponibles (dynamiquement depuis le code)
+test-list: ## Liste les tests unitaires et d'intégration disponibles
 	@printf '\nTests disponibles\n\n'
-	@cargo test -- --list 2>&1 | grep -E '^validation::tests::' | while IFS= read -r line; do \
-		name=$${line%%: test}; \
-		printf '  %s\n' "$$name"; \
-	done
+	@cargo test -- --list 2>&1 | awk '\
+	/Running (unittests|tests|doctests)/ { \
+	  target = $$0; sub(/^.*Running /, "", target); sub(/ \(.*/, "", target); \
+	  current = ++groups; group_names[current] = target; counts[current] = 0; next; \
+	} \
+	/: test$$/ { \
+	  name = $$0; sub(/: test$$/, "", name); \
+	  counts[current]++; tests[current, counts[current]] = name; \
+	} \
+	END { \
+	  for (g = 1; g <= groups; g++) if (counts[g] > 0) { \
+	    printf "  %s (%d)\n", group_names[g], counts[g]; \
+	    for (i = 1; i <= counts[g]; i++) printf "    %s\n", tests[g, i]; \
+	  } \
+	}'
 	@printf '\n'
 
-test-watch: ## Lance les tests en mode watch (nécessite cargo-watch)
+test-watch: ## Relance les tests à chaque changement (nécessite cargo-watch)
+	@if ! cargo watch --version >/dev/null 2>&1; then \
+		printf '\033[1;31m[erreur]\033[0m cargo-watch n’est pas installé.\n'; \
+		printf '  Installe-le avec : cargo install cargo-watch\n'; \
+		exit 127; \
+	fi
 	cargo watch -x test
 
 # ── dev ──────────────────────────────────────────────────────────────────────

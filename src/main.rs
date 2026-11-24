@@ -2,6 +2,10 @@ mod auth;
 mod validation;
 mod zone;
 
+use squilladns::request_limits::{
+    body_limit, parse_max_request_body_bytes, ENV_MAX_REQUEST_BODY_BYTES,
+};
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1054,6 +1058,16 @@ async fn main() {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    let max_request_body_bytes = match parse_max_request_body_bytes(
+        std::env::var(ENV_MAX_REQUEST_BODY_BYTES).ok().as_deref(),
+    ) {
+        Ok(limit) => limit,
+        Err(error) => {
+            eprintln!("request limit config: {}", error);
+            std::process::exit(1);
+        }
+    };
+
     let token_env = std::env::var("API_TOKEN").unwrap_or_default();
     let token_path = PathBuf::from(
         std::env::var("API_TOKEN_PATH").unwrap_or_else(|_| ".state/tokens".to_string()),
@@ -1097,6 +1111,7 @@ async fn main() {
         )
         .route("/sync", post(handle_sync))
         .route("/token", post(handle_token))
+        .layer(body_limit(max_request_body_bytes))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             server_timing,
