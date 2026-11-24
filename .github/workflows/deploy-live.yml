@@ -138,12 +138,18 @@ jobs:
           echo "[deploy] Téléversement du binaire vers $TARGET_DIR/squilladns.new via SCP..."
           scp -o StrictHostKeyChecking=no -P "$VPS_SSH_PORT" target/release/squilladns "$VPS_SSH_USER@$VPS_HOST:$TARGET_DIR/squilladns.new"
 
+          echo "[deploy] Téléversement de restart.sh vers $TARGET_DIR/restart.sh via SCP..."
+          scp -o StrictHostKeyChecking=no -P "$VPS_SSH_PORT" deploy/restart.sh "$VPS_SSH_USER@$VPS_HOST:$TARGET_DIR/restart.sh"
+
           echo "[deploy] Vérification intégrité, dépendances, installation atomique et redémarrage..."
           ssh $SSH_OPTS -p "$VPS_SSH_PORT" "$VPS_SSH_USER@$VPS_HOST" bash -s -- "$TARGET_DIR" "$EXPECTED_SHA256" << 'REMOTE_SCRIPT'
           set -euo pipefail
           APP_DIR="$1"
           EXPECTED_SHA256="$2"
           cd "$APP_DIR"
+
+          # restart.sh est téléversé à chaque déploiement : garantir le bit +x.
+          [[ -f ./restart.sh ]] && chmod +x ./restart.sh 2>/dev/null || true
 
           # 1. Vérification d'intégrité SHA256 post-téléversement
           echo "[deploy] Vérification SHA256 de squilladns.new..."
