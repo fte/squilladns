@@ -34,7 +34,9 @@ Ordre d’implémentation proposé ; les identifiants renvoient à
    avant publication et définir complètement les échecs (`SPEC-WRITE-*`).
 4. **Travail bloquant et quotas** — `SPEC-IO-01..03`, `SPEC-IO-05..06`,
    `SPEC-OBS-02` : filesystem, calcul et processus hors des workers HTTP, avec
-   concurrence bornée.
+   concurrence bornée. Première étape amorcée sur listing/suppression avec
+   `MAX_PARALLEL_IO`; les écritures de zones et les processus BIND restent à
+   déplacer.
 5. **Publication BIND** — `SPEC-BIND-*` : création, modification, suppression,
    reload, délais et état `persisted`/`active`, puis coalescence des reloads.
 6. **Listing et observabilité** — `SPEC-LIST-*`, `SPEC-OBS-*` : pagination ou

@@ -11,12 +11,13 @@ use tower::ServiceExt;
 
 #[test]
 fn request_limits_default_and_parse_environment_values() {
-    let defaults = RequestLimits::from_values(None, None, None, None, None).unwrap();
+    let defaults = RequestLimits::from_values(None, None, None, None, None, None).unwrap();
     assert_eq!(defaults.max_request_body_bytes, 1024 * 1024);
     assert_eq!(defaults.max_records_per_zone, 10_000);
     assert_eq!(defaults.max_record_name_bytes, 253);
     assert_eq!(defaults.max_record_value_bytes, 4096);
     assert_eq!(defaults.max_parallel_validations, 4);
+    assert_eq!(defaults.max_parallel_io, 4);
 
     let configured = RequestLimits::from_values(
         Some("8192".into()),
@@ -24,6 +25,7 @@ fn request_limits_default_and_parse_environment_values() {
         Some("100".into()),
         Some("2048".into()),
         Some("2".into()),
+        Some("3".into()),
     )
     .unwrap();
     assert_eq!(configured.max_request_body_bytes, 8192);
@@ -31,12 +33,14 @@ fn request_limits_default_and_parse_environment_values() {
     assert_eq!(configured.max_record_name_bytes, 100);
     assert_eq!(configured.max_record_value_bytes, 2048);
     assert_eq!(configured.max_parallel_validations, 2);
+    assert_eq!(configured.max_parallel_io, 3);
 
-    assert!(RequestLimits::from_values(Some("0".into()), None, None, None, None).is_err());
-    assert!(RequestLimits::from_values(None, Some("x".into()), None, None, None).is_err());
-    assert!(RequestLimits::from_values(None, None, Some("0".into()), None, None).is_err());
-    assert!(RequestLimits::from_values(None, None, None, Some("nope".into()), None).is_err());
-    assert!(RequestLimits::from_values(None, None, None, None, Some("0".into())).is_err());
+    assert!(RequestLimits::from_values(Some("0".into()), None, None, None, None, None).is_err());
+    assert!(RequestLimits::from_values(None, Some("x".into()), None, None, None, None).is_err());
+    assert!(RequestLimits::from_values(None, None, Some("0".into()), None, None, None).is_err());
+    assert!(RequestLimits::from_values(None, None, None, Some("nope".into()), None, None).is_err());
+    assert!(RequestLimits::from_values(None, None, None, None, Some("0".into()), None).is_err());
+    assert!(RequestLimits::from_values(None, None, None, None, None, Some("0".into())).is_err());
 }
 
 #[tokio::test]

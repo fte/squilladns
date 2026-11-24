@@ -177,6 +177,7 @@ struct AppState {
     jwt: Option<JwtConfig>,
     request_limits: RequestLimits,
     validation_slots: Arc<tokio::sync::Semaphore>,
+    io_slots: Arc<tokio::sync::Semaphore>,
     zone_locks: ZoneLocks,
     /// Identité imposée par `SANDBOX_USER` (mode dev).
     sandbox: Option<AuthUser>,
@@ -755,6 +756,7 @@ async fn handle_me(Extension(caller): Extension<CallerResolution>) -> impl IntoR
     security(("bearer_token" = []))
 )]
 async fn handle_list_zones(
+    State(state): State<SharedState>,
     Extension(caller): Extension<CallerResolution>,
     Extension(timings): Extension<Timings>,
 ) -> impl IntoResponse {
@@ -764,18 +766,42 @@ async fn handle_list_zones(
     };
     let root = zone_root(&user);
 
-    match timed(&timings, "list", || list_zones(&root)) {
-        Ok(zones) => Json(ZonesResponse {
+    let result = timed_async(
+        &timings,
+        "list",
+        run_limited(Arc::clone(&state.io_slots), move || list_zones(&root)),
+    )
+    .await;
+    match result {
+        Err(BlockingWorkError::Saturated) => {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable",
+                "I/O capacity is exhausted",
+                "/zones",
+            )
+        }
+        Err(BlockingWorkError::WorkerFailed) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error",
+                "I/O worker failed",
+                "/zones",
+            )
+        }
+        Ok(Err(error)) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error",
+                &error,
+                "/zones",
+            )
+        }
+        Ok(Ok(zones)) => Json(ZonesResponse {
             zones,
             scope: scope_of(&user),
         })
         .into_response(),
-        Err(error) => problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal Server Error",
-            &error,
-            "/zones",
-        ),
     }
 }
 
@@ -914,12 +940,32 @@ async fn handle_delete_zone(
         return err(StatusCode::NOT_FOUND, "zone not found");
     }
 
-    match timed(&timings, "delete", || fs::remove_dir_all(&zone_path)) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => problem(
+    let deletion = timed_async(
+        &timings,
+        "delete",
+        run_limited(Arc::clone(&state.io_slots), move || {
+            fs::remove_dir_all(&zone_path)
+        }),
+    )
+    .await;
+    match deletion {
+        Err(BlockingWorkError::Saturated) => problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Service Unavailable",
+            "I/O capacity is exhausted",
+            &instance,
+        ),
+        Err(BlockingWorkError::WorkerFailed) => problem(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Internal Server Error",
-            &format!("failed to delete {}: {}", zone_path.display(), error),
+            "I/O worker failed",
+            &instance,
+        ),
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(error)) => problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal Server Error",
+            &format!("failed to delete zone: {}", error),
             &instance,
         ),
     }
@@ -1209,6 +1255,7 @@ async fn main() {
         validation_slots: Arc::new(tokio::sync::Semaphore::new(
             request_limits.max_parallel_validations,
         )),
+        io_slots: Arc::new(tokio::sync::Semaphore::new(request_limits.max_parallel_io)),
         zone_locks: ZoneLocks::default(),
         sandbox,
     });

@@ -7,6 +7,7 @@ pub const DEFAULT_MAX_RECORDS_PER_ZONE: usize = 10_000;
 pub const DEFAULT_MAX_RECORD_NAME_BYTES: usize = 253;
 pub const DEFAULT_MAX_RECORD_VALUE_BYTES: usize = 4096;
 pub const DEFAULT_MAX_PARALLEL_VALIDATIONS: usize = 4;
+pub const DEFAULT_MAX_PARALLEL_IO: usize = 4;
 pub const ENV_MAX_REQUEST_BODY_BYTES: &str = "MAX_REQUEST_BODY_BYTES";
 pub const ENV_MAX_RECORDS_PER_ZONE: &str = "MAX_RECORDS_PER_ZONE";
 pub const ENV_MAX_RECORD_NAME_BYTES: &str = "MAX_RECORD_NAME_BYTES";
@@ -20,6 +21,7 @@ pub struct RequestLimits {
     pub max_record_name_bytes: usize,
     pub max_record_value_bytes: usize,
     pub max_parallel_validations: usize,
+    pub max_parallel_io: usize,
 }
 
 impl Default for RequestLimits {
@@ -30,6 +32,7 @@ impl Default for RequestLimits {
             max_record_name_bytes: DEFAULT_MAX_RECORD_NAME_BYTES,
             max_record_value_bytes: DEFAULT_MAX_RECORD_VALUE_BYTES,
             max_parallel_validations: DEFAULT_MAX_PARALLEL_VALIDATIONS,
+            max_parallel_io: DEFAULT_MAX_PARALLEL_IO,
         }
     }
 }
@@ -42,6 +45,7 @@ impl RequestLimits {
             env_value(ENV_MAX_RECORD_NAME_BYTES)?,
             env_value(ENV_MAX_RECORD_VALUE_BYTES)?,
             env_value(ENV_MAX_PARALLEL_VALIDATIONS)?,
+            env_value("MAX_PARALLEL_IO")?,
         )
     }
 
@@ -51,6 +55,7 @@ impl RequestLimits {
         max_record_name_bytes: Option<String>,
         max_record_value_bytes: Option<String>,
         max_parallel_validations: Option<String>,
+        max_parallel_io: Option<String>,
     ) -> Result<Self, String> {
         let max_parallel_validations = parse_limit(
             ENV_MAX_PARALLEL_VALIDATIONS,
@@ -62,6 +67,14 @@ impl RequestLimits {
                 "{} exceeds Tokio's maximum permit count",
                 ENV_MAX_PARALLEL_VALIDATIONS
             ));
+        }
+        let max_parallel_io = parse_limit(
+            "MAX_PARALLEL_IO",
+            max_parallel_io.as_deref(),
+            DEFAULT_MAX_PARALLEL_IO,
+        )?;
+        if max_parallel_io > Semaphore::MAX_PERMITS {
+            return Err("MAX_PARALLEL_IO exceeds Tokio's maximum permit count".into());
         }
 
         Ok(Self {
@@ -86,6 +99,7 @@ impl RequestLimits {
                 DEFAULT_MAX_RECORD_VALUE_BYTES,
             )?,
             max_parallel_validations,
+            max_parallel_io,
         })
     }
 }

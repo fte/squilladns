@@ -22,6 +22,7 @@ configure ; l’API ne remplace pas la déclaration des zones dans named.conf.
 | MAX_RECORD_NAME_BYTES | 253 | Longueur maximale du nom propriétaire d’un RR, en octets |
 | MAX_RECORD_VALUE_BYTES | 4096 | Longueur maximale de la valeur d’un RR, en octets |
 | MAX_PARALLEL_VALIDATIONS | 4 | Nombre maximal de parsing/validations de zones simultanés |
+| MAX_PARALLEL_IO | 4 | Nombre maximal d’opérations de listing/suppression disque simultanées |
 | JWT_SECRET | vide | Secret HS256 historique, minimum 32 octets |
 | JWT_ED25519_PUBLIC_KEY | vide | Clé publique Ed25519 BFF en base64url (32 octets) ; prioritaire sur JWT_SECRET |
 | BFF_API_AUDIENCE | squilladns | Audience attendue dans le JWT signé par le BFF |
