@@ -36,8 +36,10 @@ Ordre d’implémentation proposé ; les identifiants renvoient à
 5. **Publication BIND** — `SPEC-BIND-01..08` implémentées sur
    `feat/bind-publisher` : zones dynamiques, réservation du nom au premier
    tenant, activation/suppression bornées et coalescence des publications.
-6. **Listing et observabilité** — `SPEC-LIST-*`, `SPEC-OBS-*` : pagination ou
-   index selon le besoin, timings, erreurs et métriques.
+6. **Listing et observabilité** — `SPEC-LIST-01` et `04` terminées sur
+   `feat/list-zone-pagination` : listing sans lecture des fichiers de zone,
+   pagination par offset, limite par page. `SPEC-LIST-02..03` restent
+   conditionnelles à un besoin d’index ; `SPEC-OBS-01`, `03..05` restent à faire.
 7. **Vérification** — `SPEC-T-*`, `SPEC-AC-*` : tests unitaires et de
    concurrence, puis tests d’intégration contre un BIND réel.
 

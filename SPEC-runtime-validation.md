@@ -167,13 +167,13 @@ requises au déploiement.
 
 ## Listing et index
 
-- **SPEC-LIST-01** Le listing ne lit pas tous les contenus de zone pour obtenir nom et serial.
+- **SPEC-LIST-01 [x]** Le listing ne lit pas les contenus de zone pour obtenir les noms ; le serial n’est pas chargé lors du listing.
 - **SPEC-LIST-02** Si le coût de parcours disque devient important, maintenir un index dérivé
   reconstruisible à partir des fichiers. Les fichiers validés restent la
   source de vérité, sauf décision future de migration.
 - **SPEC-LIST-03** L’index est isolé par tenant, cohérent après redémarrage et mis à jour sous
   les mêmes règles de sérialisation que les écritures.
-- **SPEC-LIST-04** Une pagination et un plafond de résultats sont requis avant que le nombre de
+- **SPEC-LIST-04 [x]** Une pagination et un plafond de résultats sont requis avant que le nombre de
   zones par tenant puisse croître sans borne.
 
 ## Exploitabilité et observabilité

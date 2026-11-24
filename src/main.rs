@@ -32,6 +32,8 @@ use auth::{AuthError, AuthUser, JwtConfig, TokenStore};
 use validation::{ProblemDetails, ValidationErrorCode};
 
 const VERSION: &str = "0.1.0";
+const DEFAULT_ZONE_LIST_LIMIT: usize = 100;
+const MAX_ZONE_LIST_LIMIT: usize = 500;
 
 const HEADER_SERVER_TIMING: HeaderName = HeaderName::from_static("server-timing");
 const HEADER_RESPONSE_TIME: HeaderName = HeaderName::from_static("x-response-time");
@@ -75,6 +77,7 @@ const HEADER_TIMING_ALLOW_ORIGIN: HeaderName = HeaderName::from_static("timing-a
         HealthResponse,
         MeResponse,
         ZonesResponse,
+        ZoneListQuery,
         TokenResponse,
         TokenRequest,
         SyncResponse,
@@ -116,8 +119,18 @@ struct MeResponse {
 #[derive(Serialize, ToSchema)]
 struct ZonesResponse {
     zones: Vec<String>,
+    /// Offset à utiliser pour récupérer la page suivante.
+    next_offset: Option<usize>,
     /// `public` (anonyme) ou `private` (authentifié)
     scope: String,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct ZoneListQuery {
+    /// Nombre maximal de zones dans la réponse (1 à 500, défaut 100).
+    limit: Option<usize>,
+    /// Nombre de zones à ignorer avant la page retournée.
+    offset: Option<usize>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -655,12 +668,16 @@ fn migrate_legacy_zone_root(user: &Option<AuthUser>, current: &Path) {
     }
 }
 
-fn list_zones(root: &Path) -> Result<Vec<String>, String> {
+fn list_zones(
+    root: &Path,
+    offset: usize,
+    limit: usize,
+) -> Result<(Vec<String>, Option<usize>), String> {
     let mut zones = Vec::new();
 
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(zones),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((zones, None)),
         Err(error) => return Err(format!("read {}: {}", root.display(), error)),
     };
 
@@ -676,7 +693,13 @@ fn list_zones(root: &Path) -> Result<Vec<String>, String> {
     }
 
     zones.sort();
-    Ok(zones)
+    let mut page: Vec<_> = zones.into_iter().skip(offset).take(limit + 1).collect();
+    let has_more = page.len() > limit;
+    if has_more {
+        page.pop();
+    }
+    let next_offset = has_more.then(|| offset.saturating_add(limit));
+    Ok((page, next_offset))
 }
 
 fn err(status: StatusCode, msg: &str) -> axum::response::Response {
@@ -1015,6 +1038,10 @@ async fn handle_me(Extension(caller): Extension<CallerResolution>) -> impl IntoR
 #[utoipa::path(
     get,
     path = "/zones",
+    params(
+        ("limit" = Option<usize>, Query, description = "Nombre de zones (1 à 500, défaut 100)"),
+        ("offset" = Option<usize>, Query, description = "Décalage de pagination")
+    ),
     responses(
         (status = 200, description = "Liste des zones", body = ZonesResponse),
         (status = 503, description = "Capacité I/O momentanément saturée", body = ProblemDetails),
@@ -1026,11 +1053,22 @@ async fn handle_list_zones(
     State(state): State<SharedState>,
     Extension(caller): Extension<CallerResolution>,
     Extension(timings): Extension<Timings>,
+    Query(query): Query<ZoneListQuery>,
 ) -> impl IntoResponse {
     let user = match caller.0 {
         Ok(user) => user,
         Err(error) => return auth_problem(error, "/zones"),
     };
+    let limit = query.limit.unwrap_or(DEFAULT_ZONE_LIST_LIMIT);
+    if !(1..=MAX_ZONE_LIST_LIMIT).contains(&limit) {
+        return problem(
+            StatusCode::BAD_REQUEST,
+            "Bad Request",
+            "limit must be between 1 and 500",
+            "/zones",
+        );
+    }
+    let offset = query.offset.unwrap_or(0);
     let root = zone_root(&user);
     let user_for_work = user.clone();
 
@@ -1039,7 +1077,7 @@ async fn handle_list_zones(
         "list",
         run_limited(Arc::clone(&state.io_slots), move || {
             migrate_legacy_zone_root(&user_for_work, &root);
-            list_zones(&root)
+            list_zones(&root, offset, limit)
         }),
     )
     .await;
@@ -1068,8 +1106,9 @@ async fn handle_list_zones(
                 "/zones",
             )
         }
-        Ok(Ok(zones)) => Json(ZonesResponse {
+        Ok(Ok((zones, next_offset))) => Json(ZonesResponse {
             zones,
+            next_offset,
             scope: scope_of(&user),
         })
         .into_response(),
@@ -1761,6 +1800,28 @@ async fn main() {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn zone_listing_is_sorted_and_paged_with_a_bounded_page() {
+        let root = std::env::temp_dir().join(format!("squilladns-list-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        for name in ["c.test", "a.test", "b.test"] {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(format!("{}.zone", name)), "zone file").unwrap();
+        }
+
+        let (first, next_offset) = list_zones(&root, 0, 2).unwrap();
+        assert_eq!(first, ["a.test", "b.test"]);
+        assert_eq!(next_offset, Some(2));
+
+        let (last, next_offset) = list_zones(&root, 2, 2).unwrap();
+        assert_eq!(last, ["c.test"]);
+        assert_eq!(next_offset, None);
+        assert!(list_zones(&root, 100, 2).unwrap().0.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn server_timing_lists_total_then_steps() {
