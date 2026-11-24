@@ -1939,7 +1939,12 @@ fn cors_layer() -> CorsLayer {
 
     let layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE, header::ACCEPT])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            HEADER_REQUEST_ID.clone(),
+        ])
         // Sans ces expositions, le navigateur masque les en-têtes de timing
         // et `performance.*.serverTiming` reste vide.
         .expose_headers([
@@ -2081,6 +2086,7 @@ async fn main() {
 mod tests {
     use super::*;
     use std::time::Duration;
+    use tower::ServiceExt;
 
     fn temp_test_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("squilladns-{}-{}", name, std::process::id()));
@@ -2199,6 +2205,55 @@ mod tests {
         assert_eq!(tenant_a, same_owner);
         assert_ne!(tenant_a, tenant_b);
         assert_ne!(tenant_a, other_zone);
+    }
+
+    #[tokio::test]
+    async fn cors_allows_clients_to_send_and_read_request_ids() {
+        let app = Router::new()
+            .route("/", get(|| async { "ok" }))
+            .layer(cors_layer());
+        let preflight = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/")
+                    .header(header::ORIGIN, "https://client.example")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "x-request-id")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preflight.status(), StatusCode::OK);
+        assert!(preflight
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("x-request-id"));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::ORIGIN, "https://client.example")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response
+            .headers()
+            .get(header::ACCESS_CONTROL_EXPOSE_HEADERS)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("x-request-id"));
     }
 
     #[test]
