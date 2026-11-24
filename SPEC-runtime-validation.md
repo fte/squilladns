@@ -107,11 +107,11 @@ de zone et `named-checkzone` prennent aussi le quota CPU
 
 Pour un remplacement, l’ordre logique est :
 
-1. **SPEC-WRITE-01** Authentifier et résoudre le tenant depuis le credential.
-2. **SPEC-WRITE-02** Normaliser et valider complètement le payload et ses limites.
-3. **SPEC-WRITE-03** Acquérir le verrou de zone.
-4. **SPEC-WRITE-04** Lire le serial courant et construire le nouveau serial.
-5. **SPEC-WRITE-05** Générer un fichier temporaire dans le même filesystem que le fichier cible.
+1. **SPEC-WRITE-01 [x]** Authentifier et résoudre le tenant depuis le credential.
+2. **SPEC-WRITE-02 [x]** Normaliser et valider complètement le payload et ses limites.
+3. **SPEC-WRITE-03 [x]** Acquérir le verrou de zone.
+4. **SPEC-WRITE-04 [x]** Lire le serial courant et construire le nouveau serial.
+5. **SPEC-WRITE-05 [x]** Générer un fichier temporaire dans le même filesystem que le fichier cible.
 6. **SPEC-WRITE-06 [x]** Lancer `named-checkzone` sur le temporaire avec délai maximal et limites de
    sortie (5 secondes ; stdout/stderr redirigés, aucune sortie capturée). Un
    timeout renvoie `503 Service Unavailable`.
@@ -121,7 +121,7 @@ Pour un remplacement, l’ordre logique est :
 9. **SPEC-WRITE-09 [x]** Demander la publication/relecture à BIND et retourner distinctement le
    résultat `persisted` et le résultat `active` (absent si aucun reload n’a été demandé).
 
-**SPEC-WRITE-10** Les erreurs de validation et de disque ne doivent jamais exposer des chemins
+**SPEC-WRITE-10 [x]** Les erreurs de validation et de disque ne doivent jamais exposer des chemins
 absolus, secrets ou détails de configuration interne. Un échec de validation ne
 doit pas réécrire l’ancienne zone : elle n’a pas été remplacée.
 
@@ -210,14 +210,15 @@ requises au déploiement.
 
 ## Décisions à prendre avant l’implémentation
 
-1. **SPEC-DEC-01** Choisir les valeurs par défaut des limites (octets, RR/zone, concurrence,
+1. **SPEC-DEC-01 [x]** Choisir les valeurs par défaut des limites (octets, RR/zone, concurrence,
    délais) et leurs variables de configuration.
-2. **SPEC-DEC-02** Choisir la source de vérité BIND : configuration générée/reconfigurée ou
+2. **SPEC-DEC-02 [x]** Choisir la source de vérité BIND : configuration générée/reconfigurée ou
    `rndc addzone`/`delzone` avec `allow-new-zones`.
-3. **SPEC-DEC-03** Définir le contrat HTTP de publication partielle : réponse synchrone avec
+3. **SPEC-DEC-03 [x]** Définir le contrat HTTP de publication partielle : réponse synchrone avec
    état `persisted`/`active`, ou ressource de travail asynchrone avec polling.
-4. **SPEC-DEC-04** Définir le catalogue RR et les champs API typés, et décider si un format
-   RFC 3597 opaque est nécessaire.
+4. **SPEC-DEC-04 [x]** Définir le catalogue RR et les champs API typés, et décider si un format
+   RFC 3597 opaque est nécessaire. Décision : le catalogue explicite suffit pour ce MVP ;
+   le format opaque n’est pas pris en charge.
 5. **SPEC-DEC-05** Vérifier la version Hickory retenue contre le catalogue RR requis et décider
    quelles dépendances inutilisées seront supprimées.
 
