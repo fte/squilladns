@@ -19,16 +19,16 @@ propriété globale des noms sont implémentés.
 Ordre d’implémentation proposé ; les identifiants renvoient à
 [SPEC-runtime-validation.md](SPEC-runtime-validation.md) :
 
-1. **Décisions préalables** — `SPEC-DEC-01..05` : valeurs par défaut des
-   limites, catalogue et format des RR, validation Hickory, source de vérité
-   BIND et contrat HTTP de publication.
+1. **Décisions préalables** — `SPEC-DEC-01..04` terminées ; reste
+   `SPEC-DEC-05`, la revue des versions Hickory et des dépendances inutilisées.
 2. **Bornes et sécurité RR** — `SPEC-IN-01..04` et `SPEC-RR-01..05` terminées :
    plafonds, validation et sérialisation typées, catalogue explicite,
    protection contre l’injection et conflits CNAME. `named-checkzone` reste le
    contrôle final de cohérence avec BIND.
-3. **Intégrité des écritures** — `SPEC-IO-04` terminé : verrou par tenant/zone
-   partagé par PUT, sync et DELETE ; remplacement atomique du fichier. `SPEC-WRITE-06..09`
-   terminées : vérification `named-checkzone` sur le temporaire avant publication,
+3. **Intégrité des écritures** — `SPEC-IO-04` et `SPEC-WRITE-01..10` terminées :
+   verrou global par nom DNS, remplacement atomique, validation temporaire et erreurs
+   sans chemin absolu ;
+   vérification `named-checkzone` avant publication,
    nettoyage en cas d’échec et résultats de persistance/activation distincts.
 4. **Travail bloquant et quotas** — `SPEC-IO-01..06` et `SPEC-OBS-02`
    terminées. Les tests couvrent le rejet à saturation, la libération des
@@ -36,8 +36,10 @@ Ordre d’implémentation proposé ; les identifiants renvoient à
 5. **Publication BIND** — `SPEC-BIND-01..08` implémentées sur
    `feat/bind-publisher` : zones dynamiques, réservation du nom au premier
    tenant, activation/suppression bornées et coalescence des publications.
-6. **Listing et observabilité** — `SPEC-LIST-*`, `SPEC-OBS-*` : pagination ou
-   index selon le besoin, timings, erreurs et métriques.
+6. **Listing et observabilité** — `SPEC-LIST-01` et `04` terminées sur
+   `feat/list-zone-pagination` : listing sans lecture des fichiers de zone,
+   pagination par offset, limite par page. `SPEC-LIST-02..03` restent
+   conditionnelles à un besoin d’index ; `SPEC-OBS-01`, `03..05` restent à faire.
 7. **Vérification** — `SPEC-T-*`, `SPEC-AC-*` : tests unitaires et de
    concurrence, puis tests d’intégration contre un BIND réel.
 

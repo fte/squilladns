@@ -11,6 +11,7 @@ API Rust pour gérer des zones BIND9 via HTTP. État du projet : MVP 0.1.x.
 
 - Fichiers de zones séparés par tenant ; noms DNS uniques globalement, attribués au premier tenant qui les crée.
 - PUT /zones/{name} remplace une zone ; DELETE la supprime ; GET /zones la liste.
+- GET /zones accepte `limit` (défaut 100, maximum 500) et `offset` pour paginer.
 - SOA généré automatiquement ; NS apex ajouté si absent.
 - Types acceptés : A, AAAA, CNAME, MX, NS, TXT, SRV, CAA.
 - Serial : max(serial existant + 1, date UTC).
