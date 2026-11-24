@@ -261,6 +261,21 @@ struct PublicationRequest {
     reply: tokio::sync::oneshot::Sender<Result<(), PublicationError>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct PublicationBatchKey {
+    tenant: String,
+    zone_name: String,
+}
+
+impl PublicationBatchKey {
+    fn new(tenant: &str, zone_name: &str) -> Self {
+        Self {
+            tenant: tenant.to_string(),
+            zone_name: zone_name.to_string(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PublicationError {
     Saturated,
@@ -337,9 +352,10 @@ impl PublicationQueue {
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<PublicationRequest>(256);
         tokio::spawn(async move {
             while let Some(first) = receiver.recv().await {
-                let mut batches: HashMap<String, Vec<PublicationRequest>> = HashMap::new();
+                let mut batches: HashMap<PublicationBatchKey, Vec<PublicationRequest>> =
+                    HashMap::new();
                 batches
-                    .entry(first.zone_name.clone())
+                    .entry(PublicationBatchKey::new(&first.tenant, &first.zone_name))
                     .or_default()
                     .push(first);
 
@@ -349,16 +365,17 @@ impl PublicationQueue {
                     tokio::select! {
                         _ = &mut debounce => break,
                         request = receiver.recv() => match request {
-                            Some(request) => batches.entry(request.zone_name.clone()).or_default().push(request),
+                            Some(request) => batches.entry(PublicationBatchKey::new(&request.tenant, &request.zone_name)).or_default().push(request),
                             None => break,
                         }
                     }
                 }
 
-                for (zone_name, requests) in batches {
+                for (key, requests) in batches {
                     let last = requests.last().expect("nonempty publication batch");
                     let root = last.root.clone();
-                    let tenant = last.tenant.clone();
+                    let tenant = key.tenant;
+                    let zone_name = key.zone_name;
                     let request_timings: Vec<_> = requests
                         .iter()
                         .map(|request| (request.timings.clone(), request.queued_at))
@@ -2170,6 +2187,18 @@ mod tests {
             16,
             "un id avec espace est remplacé"
         );
+    }
+
+    #[test]
+    fn publication_batches_are_isolated_by_tenant_and_zone() {
+        let tenant_a = PublicationBatchKey::new("tenant-a", "example.test");
+        let same_owner = PublicationBatchKey::new("tenant-a", "example.test");
+        let tenant_b = PublicationBatchKey::new("tenant-b", "example.test");
+        let other_zone = PublicationBatchKey::new("tenant-a", "other.test");
+
+        assert_eq!(tenant_a, same_owner);
+        assert_ne!(tenant_a, tenant_b);
+        assert_ne!(tenant_a, other_zone);
     }
 
     #[test]
