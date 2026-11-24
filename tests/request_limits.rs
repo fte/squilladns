@@ -4,19 +4,22 @@ use axum::{
     routing::post,
     Router,
 };
-use squilladns::request_limits::{body_limit, run_limited, BlockingWorkError, RequestLimits};
+use squilladns::request_limits::{
+    body_limit, run_limited, run_limited_by, BlockingWorkError, RequestLimits,
+};
 use std::sync::{mpsc, Arc};
 use tokio::sync::Semaphore;
 use tower::ServiceExt;
 
 #[test]
 fn request_limits_default_and_parse_environment_values() {
-    let defaults = RequestLimits::from_values(None, None, None, None, None).unwrap();
+    let defaults = RequestLimits::from_values(None, None, None, None, None, None).unwrap();
     assert_eq!(defaults.max_request_body_bytes, 1024 * 1024);
     assert_eq!(defaults.max_records_per_zone, 10_000);
     assert_eq!(defaults.max_record_name_bytes, 253);
     assert_eq!(defaults.max_record_value_bytes, 4096);
     assert_eq!(defaults.max_parallel_validations, 4);
+    assert_eq!(defaults.max_parallel_io, 4);
 
     let configured = RequestLimits::from_values(
         Some("8192".into()),
@@ -24,6 +27,7 @@ fn request_limits_default_and_parse_environment_values() {
         Some("100".into()),
         Some("2048".into()),
         Some("2".into()),
+        Some("3".into()),
     )
     .unwrap();
     assert_eq!(configured.max_request_body_bytes, 8192);
@@ -31,12 +35,14 @@ fn request_limits_default_and_parse_environment_values() {
     assert_eq!(configured.max_record_name_bytes, 100);
     assert_eq!(configured.max_record_value_bytes, 2048);
     assert_eq!(configured.max_parallel_validations, 2);
+    assert_eq!(configured.max_parallel_io, 3);
 
-    assert!(RequestLimits::from_values(Some("0".into()), None, None, None, None).is_err());
-    assert!(RequestLimits::from_values(None, Some("x".into()), None, None, None).is_err());
-    assert!(RequestLimits::from_values(None, None, Some("0".into()), None, None).is_err());
-    assert!(RequestLimits::from_values(None, None, None, Some("nope".into()), None).is_err());
-    assert!(RequestLimits::from_values(None, None, None, None, Some("0".into())).is_err());
+    assert!(RequestLimits::from_values(Some("0".into()), None, None, None, None, None).is_err());
+    assert!(RequestLimits::from_values(None, Some("x".into()), None, None, None, None).is_err());
+    assert!(RequestLimits::from_values(None, None, Some("0".into()), None, None, None).is_err());
+    assert!(RequestLimits::from_values(None, None, None, Some("nope".into()), None, None).is_err());
+    assert!(RequestLimits::from_values(None, None, None, None, Some("0".into()), None).is_err());
+    assert!(RequestLimits::from_values(None, None, None, None, None, Some("0".into())).is_err());
 }
 
 #[tokio::test]
@@ -83,4 +89,45 @@ async fn bounded_blocking_work_rejects_when_all_validation_slots_are_busy() {
 
     release_tx.send(()).unwrap();
     assert_eq!(first.await.unwrap().unwrap(), 42);
+}
+
+#[tokio::test]
+async fn multi_quota_work_releases_partial_permits_when_one_quota_is_full() {
+    let io_slots = Arc::new(Semaphore::new(1));
+    let cpu_slots = Arc::new(Semaphore::new(1));
+    let _cpu_permit = cpu_slots.clone().acquire_owned().await.unwrap();
+
+    let result = run_limited_by(vec![Arc::clone(&io_slots), Arc::clone(&cpu_slots)], || 1).await;
+    assert_eq!(result, Err(BlockingWorkError::Saturated));
+    assert!(
+        io_slots.try_acquire().is_ok(),
+        "le quota I/O doit être rendu"
+    );
+}
+
+#[tokio::test]
+async fn blocking_worker_keeps_its_permit_after_request_cancellation() {
+    let slots = Arc::new(Semaphore::new(1));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+    let worker_slots = Arc::clone(&slots);
+    let request = tokio::spawn(async move {
+        run_limited(worker_slots, move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            finished_tx.send(()).unwrap();
+        })
+        .await
+    });
+
+    started_rx.await.unwrap();
+    request.abort();
+    assert_eq!(
+        run_limited(Arc::clone(&slots), || ()).await,
+        Err(BlockingWorkError::Saturated)
+    );
+    release_tx.send(()).unwrap();
+    finished_rx.await.unwrap();
+    assert_eq!(run_limited(slots, || ()).await, Ok(()));
 }

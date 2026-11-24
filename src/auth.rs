@@ -462,6 +462,7 @@ struct TokenEntry {
 
 /// Fichier de tokens : une ligne `<tenant>\t<slug>\t<token>`.
 /// Les anciens formats à deux champs et token seul sont migrés au chargement.
+#[derive(Clone)]
 pub struct TokenStore {
     path: PathBuf,
     entries: Vec<TokenEntry>,

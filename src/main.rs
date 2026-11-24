@@ -2,7 +2,9 @@ mod auth;
 mod validation;
 mod zone;
 
-use squilladns::request_limits::{body_limit, run_limited, BlockingWorkError, RequestLimits};
+use squilladns::request_limits::{
+    body_limit, run_limited, run_limited_by, BlockingWorkError, RequestLimits,
+};
 
 use std::collections::HashMap;
 use std::fs;
@@ -173,10 +175,12 @@ pub struct ZonePayload {
 /// `tokens` et `jwt` sont les deux seuls mécanismes d'auth : aucun provider
 /// n'est contacté, donc aucune I/O réseau dans `resolve_caller`.
 struct AppState {
-    tokens: Mutex<TokenStore>,
+    tokens: Arc<Mutex<TokenStore>>,
+    token_updates: Arc<tokio::sync::Mutex<()>>,
     jwt: Option<JwtConfig>,
     request_limits: RequestLimits,
     validation_slots: Arc<tokio::sync::Semaphore>,
+    io_slots: Arc<tokio::sync::Semaphore>,
     zone_locks: ZoneLocks,
     /// Identité imposée par `SANDBOX_USER` (mode dev).
     sandbox: Option<AuthUser>,
@@ -479,21 +483,26 @@ fn zone_root(user: &Option<AuthUser>) -> PathBuf {
     match user {
         Some(user) => {
             let root = zone::zones_dir();
-            let current = auth::tenant_dir(&root, &user.tenant);
-            if let Some(legacy) = user.legacy_tenant.as_deref() {
-                let previous = auth::tenant_dir(&root, legacy);
-                if !current.exists() && previous.exists() {
-                    if let Some(parent) = current.parent() {
-                        let _ = fs::create_dir_all(parent);
-                    }
-                    if let Err(error) = fs::rename(&previous, &current) {
-                        tracing::warn!("migration du dossier utilisateur impossible: {}", error);
-                    }
-                }
-            }
-            current
+            auth::tenant_dir(&root, &user.tenant)
         }
         None => zone::zones_dir().join("public"),
+    }
+}
+
+/// Migration de l'ancien répertoire tenant. À appeler depuis le pool I/O.
+fn migrate_legacy_zone_root(user: &Option<AuthUser>, current: &Path) {
+    let Some(user) = user else { return };
+    let Some(legacy) = user.legacy_tenant.as_deref() else {
+        return;
+    };
+    let previous = auth::tenant_dir(&zone::zones_dir(), legacy);
+    if !current.exists() && previous.exists() {
+        if let Some(parent) = current.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Err(error) = fs::rename(&previous, current) {
+            tracing::warn!("migration du dossier utilisateur impossible: {}", error);
+        }
     }
 }
 
@@ -673,6 +682,32 @@ fn restore_zone(root: &Path, zone_name: &str, zone_file: &Path, previous: Option
     }
 }
 
+enum ZoneWriteError {
+    Io(String),
+    Validation(validation::ValidationError),
+}
+
+/// Lecture, génération, validation BIND et rollback forment une seule unité
+/// de travail bloquante exécutée sous le quota I/O.
+fn write_zone_transaction(
+    root: &Path,
+    zone_name: &str,
+    records: &[validation::ValidatedRecord],
+) -> Result<(bool, i32), ZoneWriteError> {
+    let zone_file = zone::zone_file_path(root, zone_name);
+    let created = !zone_file.exists();
+    let previous = fs::read_to_string(&zone_file).ok();
+    let serial = zone::compute_serial(zone::read_serial(&zone_file));
+    let written =
+        zone::generate_zone_file(zone_name, records, serial, root).map_err(ZoneWriteError::Io)?;
+
+    if let Err(error) = check_zone_file(zone_name, &written) {
+        restore_zone(root, zone_name, &zone_file, previous);
+        return Err(ZoneWriteError::Validation(error));
+    }
+    Ok((created, serial))
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -750,11 +785,13 @@ async fn handle_me(Extension(caller): Extension<CallerResolution>) -> impl IntoR
     path = "/zones",
     responses(
         (status = 200, description = "Liste des zones", body = ZonesResponse),
+        (status = 503, description = "Capacité I/O momentanément saturée", body = ProblemDetails),
         (status = 500, description = "Erreur interne", body = ErrorResponse),
     ),
     security(("bearer_token" = []))
 )]
 async fn handle_list_zones(
+    State(state): State<SharedState>,
     Extension(caller): Extension<CallerResolution>,
     Extension(timings): Extension<Timings>,
 ) -> impl IntoResponse {
@@ -763,19 +800,47 @@ async fn handle_list_zones(
         Err(error) => return auth_problem(error, "/zones"),
     };
     let root = zone_root(&user);
+    let user_for_work = user.clone();
 
-    match timed(&timings, "list", || list_zones(&root)) {
-        Ok(zones) => Json(ZonesResponse {
+    let result = timed_async(
+        &timings,
+        "list",
+        run_limited(Arc::clone(&state.io_slots), move || {
+            migrate_legacy_zone_root(&user_for_work, &root);
+            list_zones(&root)
+        }),
+    )
+    .await;
+    match result {
+        Err(BlockingWorkError::Saturated) => {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable",
+                "I/O capacity is exhausted",
+                "/zones",
+            )
+        }
+        Err(BlockingWorkError::WorkerFailed) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error",
+                "I/O worker failed",
+                "/zones",
+            )
+        }
+        Ok(Err(error)) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error",
+                &error,
+                "/zones",
+            )
+        }
+        Ok(Ok(zones)) => Json(ZonesResponse {
             zones,
             scope: scope_of(&user),
         })
         .into_response(),
-        Err(error) => problem(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Internal Server Error",
-            &error,
-            "/zones",
-        ),
     }
 }
 
@@ -831,32 +896,55 @@ async fn handle_put_zone(
     };
 
     let root = zone_root(&user);
-    let _zone_guard = lock_zone(&state, zone_lock_key(&root, &zone_name)).await;
-    let zone_file = zone::zone_file_path(&root, &zone_name);
-    let created = !zone_file.exists();
-    let previous = fs::read_to_string(&zone_file).ok();
-    let serial = zone::compute_serial(zone::read_serial(&zone_file));
-
-    let written = match timed(&timings, "write", || {
-        zone::generate_zone_file(&zone_name, &payload, serial, &root)
-    }) {
-        Ok(path) => path,
-        Err(error) => {
+    let zone_guard = lock_zone(&state, zone_lock_key(&root, &zone_name)).await;
+    let user_for_work = user.clone();
+    let name_for_work = zone_name.clone();
+    let write_result = timed_async(
+        &timings,
+        "write",
+        run_limited_by(
+            vec![
+                Arc::clone(&state.io_slots),
+                Arc::clone(&state.validation_slots),
+            ],
+            move || {
+                let _zone_guard = zone_guard;
+                migrate_legacy_zone_root(&user_for_work, &root);
+                write_zone_transaction(&root, &name_for_work, &payload)
+            },
+        ),
+    )
+    .await;
+    let (created, serial) = match write_result {
+        Err(BlockingWorkError::Saturated) => {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable",
+                "I/O capacity is exhausted",
+                &instance,
+            )
+        }
+        Err(BlockingWorkError::WorkerFailed) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error",
+                "I/O worker failed",
+                &instance,
+            )
+        }
+        Ok(Err(ZoneWriteError::Io(error))) => {
             return problem(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Internal Server Error",
                 &error,
                 &instance,
-            );
+            )
         }
+        Ok(Err(ZoneWriteError::Validation(error))) => {
+            return validation_problem(&[error], &instance)
+        }
+        Ok(Ok(result)) => result,
     };
-
-    if let Err(error) = timed(&timings, "checkzone", || {
-        check_zone_file(&zone_name, &written)
-    }) {
-        restore_zone(&root, &zone_name, &zone_file, previous);
-        return validation_problem(&[error], &instance);
-    }
 
     let (code, status) = if created {
         (StatusCode::CREATED, "created")
@@ -884,6 +972,7 @@ async fn handle_put_zone(
     responses(
         (status = 204, description = "Zone supprimée"),
         (status = 404, description = "Zone introuvable", body = ErrorResponse),
+        (status = 503, description = "Capacité I/O momentanément saturée", body = ProblemDetails),
         (status = 400, description = "Nom invalide", body = ProblemDetails),
         (status = 422, description = "Nom invalide", body = ProblemDetails),
         (status = 500, description = "Erreur interne", body = ProblemDetails),
@@ -908,18 +997,43 @@ async fn handle_delete_zone(
     };
 
     let root = zone_root(&user);
-    let _zone_guard = lock_zone(&state, zone_lock_key(&root, &zone_name)).await;
+    let zone_guard = lock_zone(&state, zone_lock_key(&root, &zone_name)).await;
+    let user_for_work = user.clone();
     let zone_path = root.join(&zone_name);
-    if !zone_path.is_dir() {
-        return err(StatusCode::NOT_FOUND, "zone not found");
-    }
-
-    match timed(&timings, "delete", || fs::remove_dir_all(&zone_path)) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => problem(
+    let deletion = timed_async(
+        &timings,
+        "delete",
+        run_limited(Arc::clone(&state.io_slots), move || {
+            let _zone_guard = zone_guard;
+            migrate_legacy_zone_root(&user_for_work, &root);
+            if !zone_path.is_dir() {
+                return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+            }
+            fs::remove_dir_all(&zone_path)
+        }),
+    )
+    .await;
+    match deletion {
+        Err(BlockingWorkError::Saturated) => problem(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Service Unavailable",
+            "I/O capacity is exhausted",
+            &instance,
+        ),
+        Err(BlockingWorkError::WorkerFailed) => problem(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Internal Server Error",
-            &format!("failed to delete {}: {}", zone_path.display(), error),
+            "I/O worker failed",
+            &instance,
+        ),
+        Ok(Ok(())) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            err(StatusCode::NOT_FOUND, "zone not found")
+        }
+        Ok(Err(error)) => problem(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Internal Server Error",
+            &format!("failed to delete zone: {}", error),
             &instance,
         ),
     }
@@ -990,48 +1104,69 @@ async fn handle_sync(
     };
 
     let root = zone_root(&user);
-    let _zone_guard = lock_zone(&state, zone_lock_key(&root, &zone_name)).await;
-    let zone_file = zone::zone_file_path(&root, &zone_name);
-
-    let serial = match payload {
-        Some(payload) => {
-            let serial = zone::compute_serial(zone::read_serial(&zone_file));
-            let previous = fs::read_to_string(&zone_file).ok();
-            let written = match timed(&timings, "write", || {
-                zone::generate_zone_file(&zone_name, &payload, serial, &root)
-            }) {
-                Ok(path) => path,
-                Err(error) => {
-                    return problem(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Internal Server Error",
-                        &error,
-                        INSTANCE,
-                    );
-                }
-            };
-
-            if let Err(error) = timed(&timings, "checkzone", || {
-                check_zone_file(&zone_name, &written)
-            }) {
-                restore_zone(&root, &zone_name, &zone_file, previous);
-                return validation_problem(&[error], INSTANCE);
-            }
-
-            serial
+    let zone_guard = lock_zone(&state, zone_lock_key(&root, &zone_name)).await;
+    let user_for_work = user.clone();
+    let name_for_work = zone_name.clone();
+    let serial_result = timed_async(
+        &timings,
+        "write",
+        run_limited_by(
+            vec![
+                Arc::clone(&state.io_slots),
+                Arc::clone(&state.validation_slots),
+            ],
+            move || {
+                let _zone_guard = zone_guard;
+                migrate_legacy_zone_root(&user_for_work, &root);
+                let serial = match payload {
+                    Some(records) => write_zone_transaction(&root, &name_for_work, &records)?.1,
+                    None => match zone::read_serial(&zone::zone_file_path(&root, &name_for_work)) {
+                        Some(serial) => serial,
+                        None => return Ok(None),
+                    },
+                };
+                let reloaded = rndc_reload(&name_for_work);
+                Ok(Some((serial, reloaded)))
+            },
+        ),
+    )
+    .await;
+    let (serial, reloaded) = match serial_result {
+        Err(BlockingWorkError::Saturated) => {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable",
+                "I/O capacity is exhausted",
+                INSTANCE,
+            )
         }
-        None => match zone::read_serial(&zone_file) {
-            Some(serial) => serial,
-            None => {
-                return err(
-                    StatusCode::NOT_FOUND,
-                    &format!("zone {} not found", zone_name),
-                );
-            }
-        },
+        Err(BlockingWorkError::WorkerFailed) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error",
+                "I/O worker failed",
+                INSTANCE,
+            )
+        }
+        Ok(Err(ZoneWriteError::Io(error))) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error",
+                &error,
+                INSTANCE,
+            )
+        }
+        Ok(Err(ZoneWriteError::Validation(error))) => {
+            return validation_problem(&[error], INSTANCE)
+        }
+        Ok(Ok(Some(result))) => result,
+        Ok(Ok(None)) => {
+            return err(
+                StatusCode::NOT_FOUND,
+                &format!("zone {} not found", zone_name),
+            )
+        }
     };
-
-    let reloaded = timed(&timings, "rndc", || rndc_reload(&zone_name));
 
     Json(SyncResponse {
         status: if reloaded { "reloaded" } else { "synced" }.into(),
@@ -1054,6 +1189,7 @@ async fn handle_sync(
         (status = 201, description = "Token créé", body = TokenResponse),
         (status = 400, description = "Body invalide", body = ErrorResponse),
         (status = 401, description = "Authentification requise ou invalide", body = ProblemDetails),
+        (status = 503, description = "Capacité I/O momentanément saturée", body = ProblemDetails),
     ),
     security(("bearer_token" = []))
 )]
@@ -1091,12 +1227,49 @@ async fn handle_token(
     }
 
     let secret = timed(&timings, "token", auth::mint_token);
-    let stored = state
-        .tokens
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .add(&user.tenant, &user.slug, &secret);
-
+    let update_guard = Arc::clone(&state.token_updates).lock_owned().await;
+    let shared_tokens = Arc::clone(&state.tokens);
+    let tenant = user.tenant.clone();
+    let slug = user.slug.clone();
+    let secret_for_work = secret.clone();
+    let update = timed_async(
+        &timings,
+        "token",
+        run_limited(Arc::clone(&state.io_slots), move || {
+            let _update_guard = update_guard;
+            let mut token_store = shared_tokens
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let stored = token_store.add(&tenant, &slug, &secret_for_work);
+            if stored {
+                *shared_tokens
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = token_store;
+            }
+            stored
+        }),
+    )
+    .await;
+    let stored = match update {
+        Err(BlockingWorkError::Saturated) => {
+            return problem(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service Unavailable",
+                "I/O capacity is exhausted",
+                "/token",
+            )
+        }
+        Err(BlockingWorkError::WorkerFailed) => {
+            return problem(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Server Error",
+                "I/O worker failed",
+                "/token",
+            )
+        }
+        Ok(result) => result,
+    };
     if !stored {
         return problem(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1105,7 +1278,6 @@ async fn handle_token(
             "/token",
         );
     }
-
     (
         StatusCode::CREATED,
         Json(TokenResponse {
@@ -1203,12 +1375,14 @@ async fn main() {
     }
 
     let state = Arc::new(AppState {
-        tokens: Mutex::new(tokens),
+        tokens: Arc::new(Mutex::new(tokens)),
+        token_updates: Arc::new(tokio::sync::Mutex::new(())),
         jwt,
         request_limits,
         validation_slots: Arc::new(tokio::sync::Semaphore::new(
             request_limits.max_parallel_validations,
         )),
+        io_slots: Arc::new(tokio::sync::Semaphore::new(request_limits.max_parallel_io)),
         zone_locks: ZoneLocks::default(),
         sandbox,
     });
