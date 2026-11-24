@@ -9,8 +9,10 @@ sans base de données.
 
 La spécification du runtime, des limites, de la validation RR et de la
 publication BIND est dans [SPEC-runtime-validation.md](SPEC-runtime-validation.md).
-Elle cadre un travail futur ; les exigences qui y figurent ne sont pas toutes
-implémentées.
+Les limites d’entrée, la validation et sérialisation RR typées, le remplacement
+complet des RR, les verrous par zone et le remplacement atomique des fichiers
+sont implémentés. La validation `named-checkzone` reste postérieure à l’écriture ;
+la publication après validation préalable est encore à faire.
 
 ## À faire
 
@@ -22,13 +24,14 @@ Ordre d’implémentation proposé ; les identifiants renvoient à
 1. **Décisions préalables** — `SPEC-DEC-01..05` : valeurs par défaut des
    limites, catalogue et format des RR, validation Hickory, source de vérité
    BIND et contrat HTTP de publication.
-2. **Bornes et sécurité RR** — `SPEC-IN-*`, `SPEC-RR-*` : `SPEC-IN-01..03`
-   implémentées (taille du corps, plafonds RR/champs, parsing et validation
-   bornés) ; restent à faire la validation RR typée, la normalisation et la
-   protection contre l’injection.
-3. **Intégrité des écritures** — `SPEC-IO-04`, `SPEC-WRITE-*` : verrou par
-   tenant/zone, fichier temporaire, `named-checkzone`, renommage atomique et
-   comportement d’échec.
+2. **Bornes et sécurité RR** — `SPEC-IN-01..04` et `SPEC-RR-01..05` terminées :
+   plafonds, validation et sérialisation typées, catalogue explicite,
+   protection contre l’injection et conflits CNAME. `named-checkzone` reste le
+   contrôle final de cohérence avec BIND.
+3. **Intégrité des écritures** — `SPEC-IO-04` terminé : verrou par tenant/zone
+   partagé par PUT, sync et DELETE ; remplacement du fichier par renommage
+   atomique. À faire : valider le fichier temporaire avec `named-checkzone`
+   avant publication et définir complètement les échecs (`SPEC-WRITE-*`).
 4. **Travail bloquant et quotas** — `SPEC-IO-01..03`, `SPEC-IO-05..06`,
    `SPEC-OBS-02` : filesystem, calcul et processus hors des workers HTTP, avec
    concurrence bornée.

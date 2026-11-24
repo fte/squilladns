@@ -1,4 +1,7 @@
+use hickory_proto::rr::Name;
 use squilladns::request_limits::RequestLimits;
+use std::collections::HashMap;
+use std::fmt::Write as FmtWrite;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::process::Command;
@@ -107,6 +110,8 @@ pub enum ValidationErrorCode {
     InvalidTtl,
     /// Zone payload exceeds configured resource limits
     ResourceLimitExceeded,
+    /// Records conflict at the same owner name
+    ConflictingRecords,
 }
 
 impl ValidationErrorCode {
@@ -130,12 +135,14 @@ impl ValidationErrorCode {
             Self::EmptyLabel => "Empty Label",
             Self::InvalidTtl => "Invalid TTL",
             Self::ResourceLimitExceeded => "Payload Limit Exceeded",
+            Self::ConflictingRecords => "Conflicting DNS Records",
         }
     }
 
     pub fn status_code(&self) -> u16 {
         match self {
             Self::ResourceLimitExceeded => 413,
+            Self::ConflictingRecords => 422,
             Self::UnsupportedRecordType => 400,
             Self::ZoneValidationFailed => 422,
             _ => 400,
@@ -206,6 +213,54 @@ impl ValidationError {
 pub const SUPPORTED_RECORD_TYPES: &[&str] =
     &["A", "AAAA", "CNAME", "MX", "NS", "TXT", "SRV", "CAA"];
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedRecord {
+    pub name: Option<Name>,
+    pub data: ValidatedRData,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidatedRData {
+    A(Ipv4Addr),
+    Aaaa(Ipv6Addr),
+    Cname(Name),
+    Mx {
+        priority: u16,
+        target: Name,
+    },
+    Ns(Name),
+    Txt(Vec<u8>),
+    Srv {
+        priority: u16,
+        weight: u16,
+        port: u16,
+        target: Name,
+    },
+    Caa {
+        flags: u8,
+        tag: String,
+        value: Vec<u8>,
+    },
+}
+
+/// Encode raw DNS character-string bytes as a safe master-file string.
+pub fn quote_master_file_string(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() + 2);
+    output.push('"');
+    for byte in bytes {
+        match *byte {
+            b'"' | b'\\' => {
+                output.push('\\');
+                output.push(*byte as char);
+            }
+            0x20..=0x7e => output.push(*byte as char),
+            other => write!(&mut output, "\\{:03}", other).expect("writing to String cannot fail"),
+        }
+    }
+    output.push('"');
+    output
+}
+
 /// Validates a DNS name (absolute or relative)
 /// Returns the normalized name (lowercase, no trailing dot for relative names)
 pub fn validate_dns_name(name: &str, allow_absolute: bool) -> Result<String, ValidationError> {
@@ -216,91 +271,72 @@ pub fn validate_dns_name(name: &str, allow_absolute: bool) -> Result<String, Val
         ));
     }
 
-    let name = name.trim();
-    if name.is_empty() {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed == "." {
         return Err(ValidationError::new(
             ValidationErrorCode::EmptyLabel,
-            "DNS name cannot be whitespace only",
+            "DNS name cannot be empty or the root name",
         ));
     }
 
-    let is_absolute = name.ends_with('.');
+    let is_absolute = trimmed.ends_with('.');
     if is_absolute && !allow_absolute {
         return Err(ValidationError::new(
             ValidationErrorCode::InvalidCharacters,
             "Absolute DNS names (ending with .) not allowed for record names",
         )
         .with_field("name")
-        .with_value(name));
+        .with_value(trimmed));
     }
 
-    let labels: Vec<&str> = if is_absolute {
-        name[..name.len() - 1].split('.').collect()
-    } else {
-        name.split('.').collect()
-    };
-
-    if labels.iter().any(|l| l.is_empty()) {
-        return Err(ValidationError::new(
-            ValidationErrorCode::EmptyLabel,
-            "DNS name contains empty label",
+    let parsed = Name::from_str_relaxed(trimmed).map_err(|error| {
+        ValidationError::new(
+            ValidationErrorCode::InvalidCharacters,
+            format!("Invalid DNS name: {}", error),
         )
         .with_field("name")
-        .with_value(name));
-    }
+        .with_value(trimmed)
+    })?;
 
-    for label in &labels {
-        if label.len() > 63 {
-            return Err(ValidationError::new(
-                ValidationErrorCode::LabelTooLong,
-                format!("Label '{}' exceeds 63 characters", label),
-            )
-            .with_field("name")
-            .with_value(name));
-        }
-
-        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-            return Err(ValidationError::new(
-                ValidationErrorCode::InvalidCharacters,
-                format!(
-                    "Label '{}' contains invalid characters (only a-z, 0-9, - allowed)",
-                    label
-                ),
-            )
-            .with_field("name")
-            .with_value(name));
-        }
-
-        if label.starts_with('-') || label.ends_with('-') {
-            return Err(ValidationError::new(
-                ValidationErrorCode::InvalidCharacters,
-                format!("Label '{}' cannot start or end with hyphen", label),
-            )
-            .with_field("name")
-            .with_value(name));
-        }
-    }
-
-    let total_len = if is_absolute {
-        name.len()
-    } else {
-        name.len() + 1
-    };
-    if total_len > 253 {
+    if parsed.len() > 255 {
         return Err(ValidationError::new(
             ValidationErrorCode::LabelTooLong,
-            format!("DNS name exceeds 253 characters (got {})", total_len),
+            format!(
+                "DNS name exceeds 255 wire-format bytes (got {})",
+                parsed.len()
+            ),
         )
         .with_field("name")
-        .with_value(name));
+        .with_value(trimmed));
     }
 
-    Ok(name.to_lowercase())
+    let normalized = parsed.to_ascii().to_lowercase();
+    if is_absolute && !normalized.ends_with('.') {
+        return Err(ValidationError::new(
+            ValidationErrorCode::InvalidZoneName,
+            "Absolute DNS name must end with a dot",
+        )
+        .with_field("name")
+        .with_value(trimmed));
+    }
+    Ok(normalized)
 }
 
 /// Validates a zone name (must be absolute DNS name)
 pub fn validate_zone_name(zone: &str) -> Result<String, ValidationError> {
     let normalized = validate_dns_name(zone, true)?;
+    if normalized
+        .trim_end_matches('.')
+        .split('.')
+        .any(|label| label.starts_with('-') || label.ends_with('-'))
+    {
+        return Err(ValidationError::new(
+            ValidationErrorCode::InvalidCharacters,
+            "Zone labels cannot start or end with a hyphen",
+        )
+        .with_field("name")
+        .with_value(zone));
+    }
     if !normalized.ends_with('.') {
         Ok(format!("{}.", normalized))
     } else {
@@ -315,6 +351,17 @@ pub fn validate_record_name(name: &str) -> Result<String, ValidationError> {
     }
 
     validate_dns_name(name, false)
+}
+
+fn validated_name(value: &str) -> Result<Name, ValidationError> {
+    Name::from_str_relaxed(value).map_err(|error| {
+        ValidationError::new(
+            ValidationErrorCode::InvalidCharacters,
+            format!("Invalid DNS name: {}", error),
+        )
+        .with_field("value")
+        .with_value(value)
+    })
 }
 
 /// Validates an IPv4 address
@@ -455,21 +502,84 @@ pub fn validate_caa_value(value: &str) -> Result<(u8, String, String), Validatio
     })?;
 
     let tag = parts[1].to_string();
-    if tag.is_empty() {
+    if tag.is_empty() || tag.len() > 15 || !tag.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
         return Err(ValidationError::new(
             ValidationErrorCode::InvalidCaaRecord,
-            "CAA tag cannot be empty",
+            "CAA tag must contain 1-15 ASCII letters or digits",
         )
         .with_field("value")
         .with_value(value));
     }
 
-    let value_str = parts[2].to_string();
+    let value_str = parts[2].trim().to_string();
+    if value_str.is_empty() {
+        return Err(ValidationError::new(
+            ValidationErrorCode::InvalidCaaRecord,
+            "CAA value cannot be empty",
+        )
+        .with_field("value")
+        .with_value(value));
+    }
     Ok((flags, tag, value_str))
 }
 
-/// Validates a single record
-pub fn validate_record(record: &crate::Record) -> Result<(), ValidationError> {
+fn parse_caa_character_string(input: &str) -> Result<Vec<u8>, ValidationError> {
+    let invalid = || {
+        ValidationError::new(
+            ValidationErrorCode::InvalidCaaRecord,
+            "CAA value must be a safe character string",
+        )
+        .with_field("value")
+    };
+
+    if input.starts_with('"') {
+        if input.len() < 2 || !input.ends_with('"') {
+            return Err(invalid());
+        }
+        let bytes = input.as_bytes();
+        let mut output = Vec::with_capacity(bytes.len().saturating_sub(2));
+        let mut index = 1;
+        while index < bytes.len() - 1 {
+            match bytes[index] {
+                b'"' => return Err(invalid()),
+                b'\\' => {
+                    index += 1;
+                    if index >= bytes.len() - 1 {
+                        return Err(invalid());
+                    }
+                    if index + 2 < bytes.len() - 1
+                        && bytes[index..index + 3].iter().all(u8::is_ascii_digit)
+                    {
+                        let code = std::str::from_utf8(&bytes[index..index + 3])
+                            .ok()
+                            .and_then(|digits| digits.parse::<u16>().ok())
+                            .filter(|code| *code <= 255)
+                            .ok_or_else(invalid)?;
+                        output.push(code as u8);
+                        index += 3;
+                    } else {
+                        output.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+                byte => {
+                    output.push(byte);
+                    index += 1;
+                }
+            }
+        }
+        Ok(output)
+    } else if input.bytes().any(|byte| {
+        byte.is_ascii_whitespace() || matches!(byte, b';' | b'"' | b'\\') || byte.is_ascii_control()
+    }) {
+        Err(invalid())
+    } else {
+        Ok(input.as_bytes().to_vec())
+    }
+}
+
+/// Validates and converts one untrusted API record to normalized typed data.
+pub fn validate_record(record: &crate::Record) -> Result<ValidatedRecord, ValidationError> {
     let record_type = record.record_type.to_uppercase();
 
     if !SUPPORTED_RECORD_TYPES.contains(&record_type.as_str()) {
@@ -485,44 +595,63 @@ pub fn validate_record(record: &crate::Record) -> Result<(), ValidationError> {
         .with_value(&record.record_type));
     }
 
-    validate_record_name(&record.name)?;
-
-    match record_type.as_str() {
-        "A" => {
-            validate_ipv4(&record.value)?;
-        }
-        "AAAA" => {
-            validate_ipv6(&record.value)?;
-        }
+    let normalized_owner = validate_record_name(&record.name)?;
+    let name = if normalized_owner == "@" {
+        None
+    } else {
+        Some(validated_name(&normalized_owner)?)
+    };
+    let data = match record_type.as_str() {
+        "A" => ValidatedRData::A(validate_ipv4(&record.value)?),
+        "AAAA" => ValidatedRData::Aaaa(validate_ipv6(&record.value)?),
         "CNAME" => {
-            validate_cname_target(&record.value)?;
+            let target = validate_cname_target(&record.value)?;
+            ValidatedRData::Cname(validated_name(&target)?)
         }
         "MX" => {
-            validate_mx_value(&record.value)?;
+            let (priority, target) = validate_mx_value(&record.value)?;
+            ValidatedRData::Mx {
+                priority,
+                target: validated_name(&target)?,
+            }
         }
         "NS" => {
-            validate_ns_target(&record.value)?;
+            let target = validate_ns_target(&record.value)?;
+            ValidatedRData::Ns(validated_name(&target)?)
         }
         "TXT" => {
-            validate_txt_value(&record.value)?;
+            let value = validate_txt_value(&record.value)?;
+            ValidatedRData::Txt(value.into_bytes())
         }
         "SRV" => {
-            validate_srv_value(&record.value)?;
+            let (priority, weight, port, target) = validate_srv_value(&record.value)?;
+            ValidatedRData::Srv {
+                priority,
+                weight,
+                port,
+                target: validated_name(&target)?,
+            }
         }
         "CAA" => {
-            validate_caa_value(&record.value)?;
+            let (flags, tag, value) = validate_caa_value(&record.value)?;
+            let value = parse_caa_character_string(&value)?;
+            ValidatedRData::Caa {
+                flags,
+                tag: tag.to_ascii_lowercase(),
+                value,
+            }
         }
         _ => unreachable!(),
-    }
+    };
 
-    Ok(())
+    Ok(ValidatedRecord { name, data })
 }
 
 /// Validates all records in a zone payload
 pub fn validate_zone_payload_with_limits(
     payload: &crate::ZonePayload,
     limits: &RequestLimits,
-) -> Result<(), Vec<ValidationError>> {
+) -> Result<Vec<ValidatedRecord>, Vec<ValidationError>> {
     if payload.records.len() > limits.max_records_per_zone {
         return Err(vec![ValidationError::new(
             ValidationErrorCode::ResourceLimitExceeded,
@@ -537,6 +666,7 @@ pub fn validate_zone_payload_with_limits(
 
     let mut errors = Vec::new();
 
+    let mut validated = Vec::with_capacity(payload.records.len());
     for (idx, record) in payload.records.iter().enumerate() {
         let mut exceeded_limit = false;
         if record.name.len() > limits.max_record_name_bytes {
@@ -569,12 +699,69 @@ pub fn validate_zone_payload_with_limits(
             continue;
         }
 
-        if let Err(e) = validate_record(record) {
-            let mut err = e.with_field(&format!("records[{}]", idx));
-            if err.value.is_none() {
-                err = err.with_value(&record.value);
+        match validate_record(record) {
+            Ok(record) => validated.push(record),
+            Err(e) => {
+                let mut err = e.with_field(&format!("records[{}]", idx));
+                if err.value.is_none() {
+                    err = err.with_value(&record.value);
+                }
+                errors.push(err);
             }
-            errors.push(err);
+        }
+    }
+
+    if errors.is_empty() {
+        errors.extend(validate_record_set(&validated).err().unwrap_or_default());
+    }
+
+    if errors.is_empty() {
+        Ok(validated)
+    } else {
+        Err(errors)
+    }
+}
+
+fn validate_record_set(records: &[ValidatedRecord]) -> Result<(), Vec<ValidationError>> {
+    let mut owners: HashMap<String, (usize, usize)> = HashMap::new();
+    for record in records {
+        let owner = record
+            .name
+            .as_ref()
+            .map(|name| name.to_ascii().to_ascii_lowercase())
+            .unwrap_or_else(|| "@".into());
+        let (cname_count, other_count) = owners.entry(owner).or_default();
+        if matches!(&record.data, ValidatedRData::Cname(_)) {
+            *cname_count += 1;
+        } else {
+            *other_count += 1;
+        }
+    }
+
+    let mut errors = Vec::new();
+    for (owner, (cname_count, other_count)) in owners {
+        if cname_count == 0 {
+            continue;
+        }
+
+        let reason = if owner == "@" {
+            Some("CNAME at the zone apex conflicts with the generated SOA and NS records")
+        } else if owner == "ns" && other_count == 0 {
+            Some("CNAME at ns conflicts with the generated nameserver address record")
+        } else if cname_count > 1 || other_count > 0 {
+            Some("CNAME cannot coexist with other records at the same owner name")
+        } else {
+            None
+        };
+
+        if let Some(reason) = reason {
+            errors.push(
+                ValidationError::new(
+                    ValidationErrorCode::ConflictingRecords,
+                    format!("{} ({})", reason, owner),
+                )
+                .with_field("records"),
+            );
         }
     }
 
@@ -667,7 +854,10 @@ mod tests {
         assert!(validate_record_name("@").is_ok());
         assert!(validate_record_name("www").is_ok());
         assert!(validate_record_name("www.example").is_ok());
-        assert!(validate_record_name("_dmarc").is_err()); // underscore not allowed in our strict mode
+        assert!(validate_record_name("_dmarc").is_ok());
+        assert!(validate_record_name("_sip._tcp").is_ok());
+        assert!(validate_record_name("mail\\.ops").is_ok());
+        assert!(validate_record_name("evil\n3600 IN A 203.0.113.9").is_err());
     }
 
     #[test]
@@ -730,6 +920,75 @@ mod tests {
     }
 
     #[test]
+    fn validate_record_returns_normalized_typed_data() {
+        let record = crate::Record {
+            record_type: "a".into(),
+            name: "WWW".into(),
+            value: "192.0.2.10".into(),
+        };
+
+        assert_eq!(
+            validate_record(&record).unwrap(),
+            ValidatedRecord {
+                name: Some(Name::from_str_relaxed("www").unwrap()),
+                data: ValidatedRData::A(Ipv4Addr::new(192, 0, 2, 10)),
+            }
+        );
+    }
+
+    #[test]
+    fn validate_record_builds_structured_typed_rdata() {
+        let cname = crate::Record {
+            record_type: "CNAME".into(),
+            name: "WWW".into(),
+            value: "Target.Example.Test.".into(),
+        };
+        assert!(matches!(
+            validate_record(&cname).unwrap().data,
+            ValidatedRData::Cname(ref target) if target.to_ascii() == "target.example.test."
+        ));
+
+        let mx = crate::Record {
+            record_type: "MX".into(),
+            name: "@".into(),
+            value: "10 Mail.Example.Test.".into(),
+        };
+        assert!(matches!(
+            validate_record(&mx).unwrap().data,
+            ValidatedRData::Mx { priority: 10, ref target }
+                if target.to_ascii() == "mail.example.test."
+        ));
+
+        let srv = crate::Record {
+            record_type: "SRV".into(),
+            name: "_sip._tcp".into(),
+            value: "0 5 5060 sip.example.test.".into(),
+        };
+        assert!(matches!(
+            validate_record(&srv).unwrap().data,
+            ValidatedRData::Srv { priority: 0, weight: 5, port: 5060, ref target }
+                if target.to_ascii() == "sip.example.test."
+        ));
+    }
+
+    #[test]
+    fn validate_caa_rejects_unsafe_tags() {
+        assert!(validate_caa_value("0 issue \"letsencrypt.org\"").is_ok());
+        assert!(validate_caa_value("0 issue; \"letsencrypt.org\"").is_err());
+        assert!(validate_caa_value("0 this-tag-is-too-long \"x\"").is_err());
+    }
+
+    #[test]
+    fn validate_caa_rejects_record_injection_after_value() {
+        let record = crate::Record {
+            record_type: "CAA".into(),
+            name: "@".into(),
+            value: "0 issue \"letsencrypt.org\"\nevil 3600 IN A 203.0.113.66".into(),
+        };
+        assert!(validate_record(&record).is_err());
+    }
+
+    #[test]
     fn zone_payload_enforces_record_count_limit() {
         let payload = crate::ZonePayload {
             records: vec![
@@ -787,5 +1046,67 @@ mod tests {
         assert_eq!(errors[0].field.as_deref(), Some("records[0].name"));
         assert_eq!(errors[1].field.as_deref(), Some("records[0].value"));
         assert!(errors.iter().all(|error| error.value.is_none()));
+    }
+
+    #[test]
+    fn zone_payload_rejects_cname_conflicts_and_allows_same_type_rrsets() {
+        let limits = RequestLimits::default();
+        let conflict = crate::ZonePayload {
+            records: vec![
+                crate::Record {
+                    record_type: "CNAME".into(),
+                    name: "www".into(),
+                    value: "target.example.test.".into(),
+                },
+                crate::Record {
+                    record_type: "A".into(),
+                    name: "www".into(),
+                    value: "192.0.2.40".into(),
+                },
+            ],
+        };
+        let errors = validate_zone_payload_with_limits(&conflict, &limits).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].code, ValidationErrorCode::ConflictingRecords);
+
+        let apex_cname = crate::ZonePayload {
+            records: vec![crate::Record {
+                record_type: "CNAME".into(),
+                name: "@".into(),
+                value: "target.example.test.".into(),
+            }],
+        };
+        assert_eq!(
+            validate_zone_payload_with_limits(&apex_cname, &limits).unwrap_err()[0].code,
+            ValidationErrorCode::ConflictingRecords
+        );
+
+        let nameserver_alias = crate::ZonePayload {
+            records: vec![crate::Record {
+                record_type: "CNAME".into(),
+                name: "ns".into(),
+                value: "target.example.test.".into(),
+            }],
+        };
+        assert_eq!(
+            validate_zone_payload_with_limits(&nameserver_alias, &limits).unwrap_err()[0].code,
+            ValidationErrorCode::ConflictingRecords
+        );
+
+        let valid_rrset = crate::ZonePayload {
+            records: vec![
+                crate::Record {
+                    record_type: "A".into(),
+                    name: "www".into(),
+                    value: "192.0.2.40".into(),
+                },
+                crate::Record {
+                    record_type: "A".into(),
+                    name: "www".into(),
+                    value: "192.0.2.41".into(),
+                },
+            ],
+        };
+        assert!(validate_zone_payload_with_limits(&valid_rrset, &limits).is_ok());
     }
 }

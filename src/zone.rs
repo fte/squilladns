@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::Record;
+use crate::validation::{quote_master_file_string, ValidatedRData, ValidatedRecord};
+
+static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Chemin racine des zones pour example.invalid
 pub fn zones_dir() -> PathBuf {
@@ -48,7 +51,7 @@ pub fn read_serial(zone_file: &Path) -> Option<i32> {
 /// Génère le contenu d'un fichier de zone BIND9.
 pub fn generate_zone_file(
     zone_name: &str,
-    records: &[Record],
+    records: &[ValidatedRecord],
     serial: i32,
     zone_dir: &Path,
 ) -> Result<PathBuf, String> {
@@ -66,88 +69,79 @@ pub fn generate_zone_file(
 
     if !records
         .iter()
-        .any(|record| record.record_type.eq_ignore_ascii_case("NS") && record.name == "@")
+        .any(|record| matches!(&record.data, ValidatedRData::Ns(_)) && record.name.is_none())
     {
         lines.push(format!("@ 3600 IN NS ns.{}.", zone_name));
 
         // BIND refuse une zone dont le NS de l'apex n'a aucune adresse :
         // on injecte un A par défaut si l'utilisateur n'en fournit pas.
         if !records.iter().any(|record| {
-            record.name.eq_ignore_ascii_case("ns")
-                && (record.record_type.eq_ignore_ascii_case("A")
-                    || record.record_type.eq_ignore_ascii_case("AAAA"))
+            record
+                .name
+                .as_ref()
+                .is_some_and(|name| name.to_ascii().eq_ignore_ascii_case("ns"))
+                && matches!(&record.data, ValidatedRData::A(_) | ValidatedRData::Aaaa(_))
         }) {
             lines.push("ns 3600 IN A 127.0.0.1".into());
         }
     }
 
-    // A records
     for r in records {
-        if r.record_type == "A" {
-            lines.push(format!("{} 3600 IN A {}", r.name, r.value));
-        }
-    }
-
-    // AAAA records
-    for r in records {
-        if r.record_type == "AAAA" {
-            lines.push(format!("{} 3600 IN AAAA {}", r.name, r.value));
-        }
-    }
-
-    // CNAME records
-    for r in records {
-        if r.record_type == "CNAME" {
-            lines.push(format!("{} 3600 IN CNAME {}", r.name, r.value));
-        }
-    }
-
-    // MX records
-    for r in records {
-        if r.record_type == "MX" {
-            let priority = r.value.split_whitespace().next().unwrap_or("10");
-            let target = r.value.split_whitespace().nth(1).unwrap_or("");
-            lines.push(format!("{} 3600 IN MX {} {}", r.name, priority, target));
-        }
-    }
-
-    // NS records
-    for r in records {
-        if r.record_type == "NS" {
-            lines.push(format!("{} 3600 IN NS {}", r.name, r.value));
-        }
-    }
-
-    // TXT records
-    for r in records {
-        if r.record_type == "TXT" {
-            lines.push(format!("{} 3600 IN TXT {}", r.name, r.value));
-        }
-    }
-
-    // SRV records : value = "priority weight port target"
-    for r in records {
-        if r.record_type == "SRV" {
-            let parts: Vec<&str> = r.value.split_whitespace().collect();
-            if parts.len() >= 4 {
-                lines.push(format!(
-                    "{} 3600 IN SRV {} {} {} {}",
-                    r.name, parts[0], parts[1], parts[2], parts[3]
-                ));
+        let owner = r
+            .name
+            .as_ref()
+            .map(|name| name.to_ascii())
+            .unwrap_or_else(|| "@".into());
+        let rdata = match &r.data {
+            ValidatedRData::A(address) => format!("A {}", address),
+            ValidatedRData::Aaaa(address) => format!("AAAA {}", address),
+            ValidatedRData::Cname(target) => format!("CNAME {}", target.to_ascii()),
+            ValidatedRData::Mx { priority, target } => {
+                format!("MX {} {}", priority, target.to_ascii())
             }
-        }
-    }
-
-    // CAA records
-    for r in records {
-        if r.record_type == "CAA" {
-            lines.push(format!("{} 3600 IN CAA {}", r.name, r.value));
-        }
+            ValidatedRData::Ns(target) => format!("NS {}", target.to_ascii()),
+            ValidatedRData::Txt(value) => {
+                format!("TXT {}", quote_master_file_string(value))
+            }
+            ValidatedRData::Srv {
+                priority,
+                weight,
+                port,
+                target,
+            } => format!("SRV {} {} {} {}", priority, weight, port, target.to_ascii()),
+            ValidatedRData::Caa { flags, tag, value } => {
+                format!("CAA {} {} {}", flags, tag, quote_master_file_string(value))
+            }
+        };
+        lines.push(format!("{} 3600 IN {}", owner, rdata));
     }
 
     let zone_file_path = zone_path.join(format!("{}.zone", zone_name));
-    std::fs::write(&zone_file_path, lines.join("\n") + "\n")
-        .map_err(|e| format!("failed to write zone file: {}", e))?;
+    let contents = lines.join("\n") + "\n";
+    let temp_path = zone_path.join(format!(
+        ".{}.{}.{}.tmp",
+        zone_name,
+        std::process::id(),
+        TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let write_result = (|| {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|e| format!("failed to create temporary zone file: {}", e))?;
+        file.write_all(contents.as_bytes())
+            .map_err(|e| format!("failed to write temporary zone file: {}", e))?;
+        file.sync_all()
+            .map_err(|e| format!("failed to sync temporary zone file: {}", e))?;
+        std::fs::rename(&temp_path, &zone_file_path)
+            .map_err(|e| format!("failed to publish zone file: {}", e))
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    write_result?;
 
     Ok(zone_file_path)
 }
@@ -155,6 +149,15 @@ pub fn generate_zone_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn validated_record(record_type: &str, name: &str, value: &str) -> ValidatedRecord {
+        crate::validation::validate_record(&crate::Record {
+            record_type: record_type.into(),
+            name: name.into(),
+            value: value.into(),
+        })
+        .unwrap()
+    }
 
     #[test]
     fn zone_file_path_is_scope_ready() {
@@ -168,11 +171,7 @@ mod tests {
     #[test]
     fn read_serial_roundtrip() {
         let dir = std::env::temp_dir().join(format!("squilladns-zone-{}", std::process::id()));
-        let records = vec![Record {
-            record_type: "A".into(),
-            name: "www".into(),
-            value: "192.0.2.1".into(),
-        }];
+        let records = vec![validated_record("A", "www", "192.0.2.1")];
 
         let path = generate_zone_file("alpha.test", &records, 2026010101, &dir).unwrap();
         assert_eq!(read_serial(&path), Some(2026010101));
@@ -195,16 +194,8 @@ mod tests {
     fn no_default_a_when_user_provides_ns_address() {
         let dir = std::env::temp_dir().join(format!("squilladns-ns-{}", std::process::id()));
         let records = vec![
-            Record {
-                record_type: "NS".into(),
-                name: "ns".into(),
-                value: "ns.alpha.test.".into(),
-            },
-            Record {
-                record_type: "A".into(),
-                name: "ns".into(),
-                value: "192.0.2.53".into(),
-            },
+            validated_record("NS", "ns", "ns.alpha.test."),
+            validated_record("A", "ns", "192.0.2.53"),
         ];
 
         let path = generate_zone_file("alpha.test", &records, 1, &dir).unwrap();
@@ -212,6 +203,79 @@ mod tests {
 
         assert!(content.contains("ns 3600 IN A 192.0.2.53"));
         assert!(!content.contains("127.0.0.1"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn txt_newline_is_escaped_and_cannot_inject_another_record() {
+        let dir =
+            std::env::temp_dir().join(format!("squilladns-txt-injection-{}", std::process::id()));
+        let record = validated_record("TXT", "@", "\"ok\"\nevil 3600 IN A 203.0.113.66");
+        let path = generate_zone_file("alpha.test", &[record], 1, &dir).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+
+        let escaped = quote_master_file_string(b"\"ok\"\nevil 3600 IN A 203.0.113.66");
+        assert_eq!(escaped, r#""\"ok\"\010evil 3600 IN A 203.0.113.66""#);
+        assert!(content.contains(&format!("@ 3600 IN TXT {}", escaped)));
+        assert!(!content.lines().any(|line| line.starts_with("evil ")));
+        assert_eq!(content.lines().count(), 4);
+        if std::process::Command::new("named-checkzone")
+            .arg("-v")
+            .output()
+            .is_ok()
+        {
+            crate::validation::validate_zone_file_with_named_checkzone("alpha.test", &path)
+                .unwrap();
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn caa_value_is_quoted_and_escaped_in_master_file() {
+        let dir =
+            std::env::temp_dir().join(format!("squilladns-caa-escape-{}", std::process::id()));
+        let record = validated_record("CAA", "@", r#"0 issue "example.com;\"bad""#);
+        let path = generate_zone_file("alpha.test", &[record], 1, &dir).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+
+        assert!(content.contains(r#"@ 3600 IN CAA 0 issue "example.com;\"bad""#));
+        assert!(!content.lines().any(|line| line.starts_with("bad\"")));
+        if std::process::Command::new("named-checkzone")
+            .arg("-v")
+            .output()
+            .is_ok()
+        {
+            crate::validation::validate_zone_file_with_named_checkzone("alpha.test", &path)
+                .unwrap();
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn owner_name_with_zonefile_delimiter_is_rejected() {
+        let record = crate::Record {
+            record_type: "A".into(),
+            name: "www;evil".into(),
+            value: "192.0.2.20".into(),
+        };
+        assert!(crate::validation::validate_record(&record).is_err());
+    }
+
+    #[test]
+    fn generation_replaces_the_full_record_set() {
+        let dir = std::env::temp_dir().join(format!("squilladns-replace-{}", std::process::id()));
+        let first = vec![validated_record("A", "old", "192.0.2.30")];
+        let second = vec![validated_record("A", "new", "192.0.2.31")];
+
+        let path = generate_zone_file("alpha.test", &first, 1, &dir).unwrap();
+        generate_zone_file("alpha.test", &second, 2, &dir).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+
+        assert!(content.contains("new 3600 IN A 192.0.2.31"));
+        assert!(!content.contains("old 3600 IN A 192.0.2.30"));
 
         let _ = std::fs::remove_dir_all(dir);
     }

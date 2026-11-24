@@ -4,11 +4,12 @@ mod zone;
 
 use squilladns::request_limits::{body_limit, run_limited, BlockingWorkError, RequestLimits};
 
+use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Instant;
 
 use axum::{
@@ -176,8 +177,37 @@ struct AppState {
     jwt: Option<JwtConfig>,
     request_limits: RequestLimits,
     validation_slots: Arc<tokio::sync::Semaphore>,
+    zone_locks: ZoneLocks,
     /// Identité imposée par `SANDBOX_USER` (mode dev).
     sandbox: Option<AuthUser>,
+}
+
+#[derive(Default)]
+struct ZoneLocks(Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>);
+
+impl ZoneLocks {
+    async fn lock(&self, key: String) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.0.lock().expect("zone lock map poisoned");
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+                lock
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        };
+        lock.lock_owned().await
+    }
+}
+
+async fn lock_zone(state: &AppState, key: String) -> tokio::sync::OwnedMutexGuard<()> {
+    state.zone_locks.lock(key).await
+}
+
+fn zone_lock_key(root: &Path, zone_name: &str) -> String {
+    root.join(zone_name).to_string_lossy().into_owned()
 }
 
 /// Résultat d'authentification calculé une seule fois par le middleware,
@@ -543,13 +573,12 @@ async fn parse_and_validate_zone_payload(
     body: Bytes,
     limits: RequestLimits,
     slots: Arc<tokio::sync::Semaphore>,
-) -> Result<ZonePayload, ZonePayloadError> {
+) -> Result<Vec<validation::ValidatedRecord>, ZonePayloadError> {
     let result = run_limited(slots, move || {
         let payload = serde_json::from_slice::<ZonePayload>(&body)
             .map_err(|error| ZonePayloadError::InvalidJson(error.to_string()))?;
         validation::validate_zone_payload_with_limits(&payload, &limits)
-            .map_err(ZonePayloadError::InvalidRecords)?;
-        Ok(payload)
+            .map_err(ZonePayloadError::InvalidRecords)
     })
     .await
     .map_err(|error| match error {
@@ -802,13 +831,14 @@ async fn handle_put_zone(
     };
 
     let root = zone_root(&user);
+    let _zone_guard = lock_zone(&state, zone_lock_key(&root, &zone_name)).await;
     let zone_file = zone::zone_file_path(&root, &zone_name);
     let created = !zone_file.exists();
     let previous = fs::read_to_string(&zone_file).ok();
     let serial = zone::compute_serial(zone::read_serial(&zone_file));
 
     let written = match timed(&timings, "write", || {
-        zone::generate_zone_file(&zone_name, &payload.records, serial, &root)
+        zone::generate_zone_file(&zone_name, &payload, serial, &root)
     }) {
         Ok(path) => path,
         Err(error) => {
@@ -861,6 +891,7 @@ async fn handle_put_zone(
     security(("bearer_token" = []))
 )]
 async fn handle_delete_zone(
+    State(state): State<SharedState>,
     Extension(caller): Extension<CallerResolution>,
     Extension(timings): Extension<Timings>,
     UrlPath(name): UrlPath<String>,
@@ -876,7 +907,9 @@ async fn handle_delete_zone(
         Err(error) => return validation_problem(&[error], &instance),
     };
 
-    let zone_path = zone_root(&user).join(&zone_name);
+    let root = zone_root(&user);
+    let _zone_guard = lock_zone(&state, zone_lock_key(&root, &zone_name)).await;
+    let zone_path = root.join(&zone_name);
     if !zone_path.is_dir() {
         return err(StatusCode::NOT_FOUND, "zone not found");
     }
@@ -957,6 +990,7 @@ async fn handle_sync(
     };
 
     let root = zone_root(&user);
+    let _zone_guard = lock_zone(&state, zone_lock_key(&root, &zone_name)).await;
     let zone_file = zone::zone_file_path(&root, &zone_name);
 
     let serial = match payload {
@@ -964,7 +998,7 @@ async fn handle_sync(
             let serial = zone::compute_serial(zone::read_serial(&zone_file));
             let previous = fs::read_to_string(&zone_file).ok();
             let written = match timed(&timings, "write", || {
-                zone::generate_zone_file(&zone_name, &payload.records, serial, &root)
+                zone::generate_zone_file(&zone_name, &payload, serial, &root)
             }) {
                 Ok(path) => path,
                 Err(error) => {
@@ -1175,6 +1209,7 @@ async fn main() {
         validation_slots: Arc::new(tokio::sync::Semaphore::new(
             request_limits.max_parallel_validations,
         )),
+        zone_locks: ZoneLocks::default(),
         sandbox,
     });
 
@@ -1261,5 +1296,29 @@ mod tests {
             16,
             "un id avec espace est remplacé"
         );
+    }
+
+    #[tokio::test]
+    async fn zone_locks_serialize_same_key_and_allow_different_keys() {
+        let locks = Arc::new(ZoneLocks::default());
+        let first = locks.lock("tenant-a/alpha.test".into()).await;
+        let (sent, mut received) = tokio::sync::oneshot::channel();
+        let other_locks = Arc::clone(&locks);
+        let waiting = tokio::spawn(async move {
+            let _guard = other_locks.lock("tenant-a/alpha.test".into()).await;
+            let _ = sent.send(());
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            received.try_recv().is_err(),
+            "same zone must wait for its lock"
+        );
+        drop(first);
+        received.await.unwrap();
+        waiting.await.unwrap();
+
+        let _a = locks.lock("tenant-a/alpha.test".into()).await;
+        let _b = locks.lock("tenant-b/alpha.test".into()).await;
     }
 }
