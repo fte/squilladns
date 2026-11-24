@@ -21,6 +21,11 @@ fn first_tenant_owns_a_global_dns_name_until_release() {
     assert!(first.created);
     assert_eq!(first.state, OwnerState::Inactive);
 
+    set_zone_owner_state(&dir, "example.test", "tenant-a", OwnerState::Activating).unwrap();
+    let pending = claim_zone_owner(&dir, "example.test", "tenant-a").unwrap();
+    assert!(!pending.created);
+    assert_eq!(pending.state, OwnerState::Activating);
+
     set_zone_owner_state(&dir, "example.test", "tenant-a", OwnerState::Active).unwrap();
     let retry = claim_zone_owner(&dir, "example.test", "tenant-a").unwrap();
     assert!(!retry.created);

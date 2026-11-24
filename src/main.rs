@@ -290,10 +290,24 @@ impl PublicationQueue {
                         let Some(canonical_file) = canonical_file.to_str() else {
                             return false;
                         };
+                        if bind::set_zone_owner_state(
+                            &owners_dir,
+                            &zone_name,
+                            &tenant,
+                            bind::OwnerState::Activating,
+                        )
+                        .is_err()
+                        {
+                            tracing::error!(
+                                "could not persist pending BIND activation for {}",
+                                zone_name
+                            );
+                            return false;
+                        }
                         if let Err(error) = rndc.activate_zone(
                             &zone_name,
                             canonical_file,
-                            owner.state == bind::OwnerState::Active,
+                            owner.state != bind::OwnerState::Inactive,
                         ) {
                             tracing::warn!("BIND activation failed for {}: {:?}", zone_name, error);
                             return false;
@@ -911,7 +925,7 @@ fn delete_zone_work(
             bind::OwnerError::Conflict => ZoneDeleteError::OwnerConflict,
             bind::OwnerError::Io => ZoneDeleteError::OwnerIo,
         })?;
-    if claim.state == bind::OwnerState::Active {
+    if claim.state != bind::OwnerState::Inactive {
         rndc.delete_zone(zone_name).map_err(|error| {
             tracing::warn!("BIND deletion failed for {}: {:?}", zone_name, error);
             ZoneDeleteError::Bind(error)

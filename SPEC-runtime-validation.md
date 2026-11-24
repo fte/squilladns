@@ -147,7 +147,10 @@ doit pas réécrire l’ancienne zone : elle n’a pas été remplacée.
    logs.
 6. **SPEC-BIND-06 [x]** La création, modification et suppression doivent toutes mettre à jour
    l’état actif BIND. Une suppression retire d’abord la zone du service DNS
-   (selon le mécanisme retenu), puis supprime les fichiers sous le verrou.
+   (selon le mécanisme retenu), puis supprime les fichiers sous le verrou. Avant
+   une activation, l’état durable est marqué `activating`; il ne devient `active`
+   qu’après confirmation de `rndc`. Une suppression traite `activating` comme un
+   état potentiellement actif et demande `delzone` avant d’effacer les fichiers.
 7. **SPEC-BIND-07 [x]** Les modifications rapprochées peuvent être regroupées dans une file de
    publication. Le coalescing ne doit pas perdre la dernière version d’une zone
    ni annoncer une zone active avant confirmation de BIND.

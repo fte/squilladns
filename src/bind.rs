@@ -28,6 +28,7 @@ pub enum RndcError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnerState {
     Inactive,
+    Activating,
     Active,
 }
 
@@ -178,6 +179,7 @@ pub fn read_zone_owner(
     let tenant = fields.next().ok_or(OwnerError::Io)?;
     let state = match fields.next() {
         Some("active") => OwnerState::Active,
+        Some("activating") => OwnerState::Activating,
         Some("inactive") => OwnerState::Inactive,
         _ => return Err(OwnerError::Io),
     };
@@ -202,6 +204,7 @@ pub fn set_zone_owner_state(
 
     let state = match state {
         OwnerState::Active => "active",
+        OwnerState::Activating => "activating",
         OwnerState::Inactive => "inactive",
     };
     let temp_path = owners_dir.join(format!(
