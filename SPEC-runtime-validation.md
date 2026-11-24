@@ -189,7 +189,7 @@ requises au déploiement.
 
 ## Critères d’acceptation
 
-- **SPEC-AC-01** Un payload dépassant chacune des limites est rejeté avant toute modification
+- **SPEC-AC-01 [x]** Un payload dépassant chacune des limites est rejeté avant toute modification
   disque ; les réponses utilisent le contrat d’erreur HTTP documenté.
 - **SPEC-AC-02 [x]** Les cas de tentative d’injection via TXT, CAA, noms et autres champs textuels
   sont rejetés ou sérialisés sans produire de RR supplémentaire.
@@ -200,12 +200,13 @@ requises au déploiement.
 - **SPEC-AC-05 [x]** Une panne de `named-checkzone` laisse l’ancienne version intacte.
 - **SPEC-AC-06 [x]** Une panne ou un timeout `rndc` est reflété comme échec d’activation tout en
   conservant un état disque cohérent et réessayable.
-- **SPEC-AC-07** Un grand nombre de requêtes disque/processus ne bloque pas les routes légères
+- **SPEC-AC-07 [x]** La saturation complète des quotas I/O laisse les routes légères
+  (`/health`) disponibles ; les workers bloquants restent bornés par la configuration.
   et ne dépasse pas les limites de concurrence configurées.
 - **SPEC-AC-08** Les créations et suppressions sont vérifiées contre un BIND réel : nouvelle
   zone publiée, zone modifiée avec le nouveau contenu, zone supprimée et plus
   servie, redémarrage de BIND avec état persistant.
-- **SPEC-AC-09** Les opérations d’un tenant ne peuvent ni lister, modifier, supprimer ou
+- **SPEC-AC-09 [x]** Les opérations d’un tenant ne peuvent ni lister, modifier, supprimer ou
   publier les zones d’un autre tenant, même avec des noms et payloads malformés.
 
 ## Décisions à prendre avant l’implémentation

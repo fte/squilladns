@@ -287,6 +287,18 @@ impl PublicationError {
     }
 }
 
+fn verify_publication_owner(
+    owners_dir: &Path,
+    zone_name: &str,
+    tenant: &str,
+) -> Result<bind::OwnerState, PublicationError> {
+    match bind::read_zone_owner(owners_dir, zone_name) {
+        Ok(Some(owner)) if owner.tenant == tenant => Ok(owner.state),
+        Ok(_) => Err(PublicationError::Ownership),
+        Err(_) => Err(PublicationError::Ownership),
+    }
+}
+
 fn activate_owned_zone(
     rndc: &RndcClient,
     owners_dir: &Path,
@@ -367,12 +379,15 @@ impl PublicationQueue {
                             );
                         }
                         let owners_dir = zone_owners_dir();
-                        let owner = match bind::read_zone_owner(&owners_dir, &zone_name) {
-                            Ok(Some(owner)) if owner.tenant == tenant => owner,
-                            Ok(_) => return Err(PublicationError::Ownership),
+                        let owner_state = match verify_publication_owner(
+                            &owners_dir,
+                            &zone_name,
+                            &tenant,
+                        ) {
+                            Ok(state) => state,
                             Err(error) => {
-                                tracing::warn!(request_id = %request_id, error = ?error, "could not read zone ownership state");
-                                return Err(PublicationError::Ownership);
+                                tracing::warn!(request_id = %request_id, zone = %zone_name, "publication rejected by zone ownership");
+                                return Err(error);
                             }
                         };
                         let zone_file = zone::zone_file_path(&root, &zone_name);
@@ -389,7 +404,7 @@ impl PublicationQueue {
                             &zone_name,
                             &tenant,
                             canonical_file,
-                            owner.state,
+                            owner_state,
                             &request_timings
                                 .iter()
                                 .map(|(timings, _)| timings.clone())
@@ -745,12 +760,13 @@ fn scope_of(user: &Option<AuthUser>) -> String {
 /// Le tenant est un hachage opaque : plus de collision entre deux identités
 /// (`a@b.com` et `a_b.com` tombaient auparavant dans le même `user-a_b.com`).
 fn zone_root(user: &Option<AuthUser>) -> PathBuf {
+    zone_root_under(&zone::zones_dir(), user)
+}
+
+fn zone_root_under(zones_dir: &Path, user: &Option<AuthUser>) -> PathBuf {
     match user {
-        Some(user) => {
-            let root = zone::zones_dir();
-            auth::tenant_dir(&root, &user.tenant)
-        }
-        None => zone::zones_dir().join("public"),
+        Some(user) => auth::tenant_dir(zones_dir, &user.tenant),
+        None => zones_dir.join("public"),
     }
 }
 
@@ -1098,15 +1114,25 @@ fn delete_zone_work(
     rndc: &RndcClient,
     timings: &Timings,
 ) -> Result<Option<bool>, ZoneDeleteError> {
+    delete_zone_work_with_owners(root, zone_name, tenant, rndc, timings, &zone_owners_dir())
+}
+
+fn delete_zone_work_with_owners(
+    root: &Path,
+    zone_name: &str,
+    tenant: &str,
+    rndc: &RndcClient,
+    timings: &Timings,
+    owners_dir: &Path,
+) -> Result<Option<bool>, ZoneDeleteError> {
     let filesystem_start = Instant::now();
     let zone_path = root.join(zone_name);
     if !zone_path.is_dir() {
         return Err(ZoneDeleteError::NotFound);
     }
 
-    let owners_dir = zone_owners_dir();
     let claim =
-        bind::claim_zone_owner(&owners_dir, zone_name, tenant).map_err(|error| match error {
+        bind::claim_zone_owner(owners_dir, zone_name, tenant).map_err(|error| match error {
             bind::OwnerError::Conflict => ZoneDeleteError::OwnerConflict,
             bind::OwnerError::Io => ZoneDeleteError::OwnerIo,
         })?;
@@ -1118,11 +1144,11 @@ fn delete_zone_work(
             tracing::warn!(request_id = %timings.request_id(), zone = %zone_name, error = ?error, "BIND deletion failed");
             ZoneDeleteError::Bind(error)
         })?;
-        bind::set_zone_owner_state(&owners_dir, zone_name, tenant, bind::OwnerState::Inactive)
+        bind::set_zone_owner_state(owners_dir, zone_name, tenant, bind::OwnerState::Inactive)
             .map_err(|_| ZoneDeleteError::OwnerIo)?;
     }
     fs::remove_dir_all(&zone_path).map_err(ZoneDeleteError::Io)?;
-    bind::release_zone_owner(&owners_dir, zone_name, tenant)
+    bind::release_zone_owner(owners_dir, zone_name, tenant)
         .map_err(|_| ZoneDeleteError::OwnerIo)?;
     timings.record(
         "filesystem",
@@ -2046,6 +2072,34 @@ mod tests {
         path
     }
 
+    fn test_state(request_limits: RequestLimits) -> (SharedState, PathBuf) {
+        let state_dir = temp_test_dir(&format!("app-state-{}", rand::random::<u64>()));
+        let tokens = TokenStore::load(state_dir.join("tokens"), "test-bootstrap-token");
+        let io_slots = Arc::new(tokio::sync::Semaphore::new(request_limits.max_parallel_io));
+        let zone_locks = ZoneLocks::default();
+        let rndc =
+            RndcClient::new(state_dir.join("unused-rndc"), None, Duration::from_secs(1)).unwrap();
+        let publications =
+            PublicationQueue::new(rndc.clone(), Arc::clone(&io_slots), zone_locks.clone());
+        (
+            Arc::new(AppState {
+                tokens: Arc::new(Mutex::new(tokens)),
+                token_updates: Arc::new(tokio::sync::Mutex::new(())),
+                jwt: None,
+                request_limits,
+                validation_slots: Arc::new(tokio::sync::Semaphore::new(
+                    request_limits.max_parallel_validations,
+                )),
+                io_slots,
+                rndc,
+                publications,
+                zone_locks,
+                sandbox: None,
+            }),
+            state_dir,
+        )
+    }
+
     #[test]
     fn zone_listing_is_sorted_and_paged_with_a_bounded_page() {
         let root = std::env::temp_dir().join(format!("squilladns-list-{}", std::process::id()));
@@ -2164,6 +2218,50 @@ mod tests {
         assert_eq!(body["code"], "filesystem_error");
         assert_eq!(body["detail"], "zone storage failed");
         assert!(!body.to_string().contains("/private/"));
+    }
+
+    #[tokio::test]
+    async fn invalid_payload_is_rejected_without_acquiring_io_capacity() {
+        let mut limits = RequestLimits::default();
+        limits.max_records_per_zone = 1;
+        let (state, state_dir) = test_state(limits);
+        let payload = Bytes::from(
+            r#"{"records":[{"type":"A","name":"one","value":"192.0.2.1"},{"type":"A","name":"two","value":"192.0.2.2"}]}"#,
+        );
+        let response = handle_put_zone(
+            State(Arc::clone(&state)),
+            Extension(CallerResolution(Ok(None))),
+            Extension(Timings::default()),
+            UrlPath("example.test".into()),
+            payload,
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(state.io_slots.available_permits(), limits.max_parallel_io);
+        let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[tokio::test]
+    async fn health_remains_responsive_when_all_io_slots_are_occupied() {
+        let limits = RequestLimits::default();
+        let (state, state_dir) = test_state(limits);
+        let mut permits = Vec::new();
+        for _ in 0..limits.max_parallel_io {
+            permits.push(Arc::clone(&state.io_slots).acquire_owned().await.unwrap());
+        }
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(100),
+            handle_health(State(Arc::clone(&state))),
+        )
+        .await
+        .expect("health should not wait for filesystem or process capacity")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        drop(permits);
+        let _ = fs::remove_dir_all(state_dir);
     }
 
     #[tokio::test]
@@ -2299,6 +2397,93 @@ mod tests {
             bind::OwnerState::Activating
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn tenant_cannot_overwrite_or_delete_another_tenants_global_zone_name() {
+        let base = temp_test_dir("cross-tenant-zone");
+        let tenant_a_root = base.join("tenant-a");
+        let tenant_b_root = base.join("tenant-b");
+        let owners = base.join("owners");
+        let tenant_b_zone = zone::zone_file_path(&tenant_b_root, "example.test");
+        fs::create_dir_all(tenant_b_zone.parent().unwrap()).unwrap();
+        fs::write(&tenant_b_zone, "tenant-b sentinel").unwrap();
+        let records = vec![validation::validate_record(&Record {
+            record_type: "A".into(),
+            name: "www".into(),
+            value: "192.0.2.10".into(),
+        })
+        .unwrap()];
+        write_zone_work_with_owners(
+            &tenant_a_root,
+            "example.test",
+            &records,
+            "tenant-a",
+            &Timings::default(),
+            &owners,
+        )
+        .unwrap();
+        assert_eq!(
+            verify_publication_owner(&owners, "example.test", "tenant-b"),
+            Err(PublicationError::Ownership)
+        );
+
+        let before = fs::read_to_string(&tenant_b_zone).unwrap();
+        assert!(matches!(
+            write_zone_work_with_owners(
+                &tenant_b_root,
+                "example.test",
+                &records,
+                "tenant-b",
+                &Timings::default(),
+                &owners,
+            ),
+            Err(ZoneWriteError::OwnerConflict)
+        ));
+        let rndc = RndcClient::new(base.join("no-rndc"), None, Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            delete_zone_work_with_owners(
+                &tenant_b_root,
+                "example.test",
+                "tenant-b",
+                &rndc,
+                &Timings::default(),
+                &owners,
+            ),
+            Err(ZoneDeleteError::OwnerConflict)
+        ));
+        assert_eq!(fs::read_to_string(&tenant_b_zone).unwrap(), before);
+        assert!(fs::read_to_string(zone::zone_file_path(&tenant_a_root, "example.test")).is_ok());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn tenant_roots_keep_zone_listings_separate() {
+        let base = temp_test_dir("tenant-list-roots");
+        let user_a = Some(AuthUser {
+            email: None,
+            provider: "token".into(),
+            tenant: "tenant-a".into(),
+            legacy_tenant: None,
+            slug: "alice".into(),
+        });
+        let user_b = Some(AuthUser {
+            email: None,
+            provider: "token".into(),
+            tenant: "tenant-b".into(),
+            legacy_tenant: None,
+            slug: "bob".into(),
+        });
+        let root_a = zone_root_under(&base, &user_a);
+        let root_b = zone_root_under(&base, &user_b);
+        for (root, name) in [(&root_a, "a.example.test"), (&root_b, "b.example.test")] {
+            let dir = root.join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(format!("{}.zone", name)), "zone").unwrap();
+        }
+        assert_eq!(list_zones(&root_a, 0, 10).unwrap().0, ["a.example.test"]);
+        assert_eq!(list_zones(&root_b, 0, 10).unwrap().0, ["b.example.test"]);
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

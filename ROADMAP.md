@@ -42,7 +42,7 @@ Ordre d’implémentation proposé ; les identifiants renvoient à
    restent conditionnelles à un besoin d’index établi par mesure.
 7. **Vérification** — déjà couverts : RR rendus, écritures concurrentes
    sérialisées, panne `rndc` réessayable et échec de validation atomique.
-   Restent `SPEC-AC-01`, `07..09` ; `SPEC-AC-08` demande un BIND réel, absent
+   Restent `SPEC-AC-08`, qui exige une vérification contre un BIND réel, absent
    de l’environnement local. `SPEC-LIST-02..03` ne seront activées que si les
    timings montrent que l’index devient utile.
 
