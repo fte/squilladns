@@ -178,34 +178,35 @@ requises au déploiement.
 
 ## Exploitabilité et observabilité
 
-- **SPEC-OBS-01** Délai maximal distinct pour validation BIND et contrôle `rndc`.
+- **SPEC-OBS-01 [x]** Délai maximal configurable distinct pour `named-checkzone` et contrôle `rndc`.
 - **SPEC-OBS-02 [x]** Concurrence maximale configurable pour I/O, CPU, `named-checkzone` et `rndc`.
-- **SPEC-OBS-03** Métriques ou timings pour parsing/validation, attente du verrou, filesystem,
-  checkzone, publication BIND et taille/count des payloads.
-- **SPEC-OBS-04** Logs structurés corrélés par request ID ; aucune donnée RR sensible, token,
+- **SPEC-OBS-03 [x]** Timings `Server-Timing` pour parsing/validation, attente du verrou,
+  filesystem, checkzone, file/publication BIND et octets/count des payloads.
+- **SPEC-OBS-04 [x]** Logs structurés corrélés par request ID ; aucune donnée RR sensible, token,
   secret ou chemin absolu n’est journalisé par défaut.
-- **SPEC-OBS-05** Les erreurs de surcharge, timeout, échec checkzone, échec BIND et erreur
-  filesystem sont distinguables par le client sans révéler l’infrastructure.
+- **SPEC-OBS-05 [x]** Les erreurs de surcharge, timeout, échec checkzone, échec BIND et erreur
+  filesystem sont distinguables via des codes stables sans révéler l’infrastructure.
 
 ## Critères d’acceptation
 
-- **SPEC-AC-01** Un payload dépassant chacune des limites est rejeté avant toute modification
+- **SPEC-AC-01 [x]** Un payload dépassant chacune des limites est rejeté avant toute modification
   disque ; les réponses utilisent le contrat d’erreur HTTP documenté.
-- **SPEC-AC-02** Les cas de tentative d’injection via TXT, CAA, noms et autres champs textuels
+- **SPEC-AC-02 [x]** Les cas de tentative d’injection via TXT, CAA, noms et autres champs textuels
   sont rejetés ou sérialisés sans produire de RR supplémentaire.
-- **SPEC-AC-03** Tout RR annoncé comme accepté apparaît exactement dans le fichier publié ;
+- **SPEC-AC-03 [x]** Tout RR annoncé comme accepté apparaît exactement dans le fichier publié ;
   les RR non pris en charge sont refusés explicitement.
-- **SPEC-AC-04** Des écritures parallèles sur la même zone produisent des serials cohérents,
+- **SPEC-AC-04 [x]** Des écritures parallèles sur la même zone produisent des serials cohérents,
   aucun fichier partiel et aucun rollback qui écrase une écriture réussie.
-- **SPEC-AC-05** Une panne de `named-checkzone` laisse l’ancienne version intacte.
-- **SPEC-AC-06** Une panne ou un timeout `rndc` est reflété comme échec d’activation tout en
+- **SPEC-AC-05 [x]** Une panne de `named-checkzone` laisse l’ancienne version intacte.
+- **SPEC-AC-06 [x]** Une panne ou un timeout `rndc` est reflété comme échec d’activation tout en
   conservant un état disque cohérent et réessayable.
-- **SPEC-AC-07** Un grand nombre de requêtes disque/processus ne bloque pas les routes légères
+- **SPEC-AC-07 [x]** La saturation complète des quotas I/O laisse les routes légères
+  (`/health`) disponibles ; les workers bloquants restent bornés par la configuration.
   et ne dépasse pas les limites de concurrence configurées.
 - **SPEC-AC-08** Les créations et suppressions sont vérifiées contre un BIND réel : nouvelle
   zone publiée, zone modifiée avec le nouveau contenu, zone supprimée et plus
   servie, redémarrage de BIND avec état persistant.
-- **SPEC-AC-09** Les opérations d’un tenant ne peuvent ni lister, modifier, supprimer ou
+- **SPEC-AC-09 [x]** Les opérations d’un tenant ne peuvent ni lister, modifier, supprimer ou
   publier les zones d’un autre tenant, même avec des noms et payloads malformés.
 
 ## Décisions à prendre avant l’implémentation
@@ -219,8 +220,10 @@ requises au déploiement.
 4. **SPEC-DEC-04 [x]** Définir le catalogue RR et les champs API typés, et décider si un format
    RFC 3597 opaque est nécessaire. Décision : le catalogue explicite suffit pour ce MVP ;
    le format opaque n’est pas pris en charge.
-5. **SPEC-DEC-05** Vérifier la version Hickory retenue contre le catalogue RR requis et décider
-   quelles dépendances inutilisées seront supprimées.
+5. **SPEC-DEC-05 [x]** Hickory `hickory-proto` 0.25.2 fournit `Name` et `RData` pour le
+   catalogue ; l’application conserve une sérialisation explicite pour ses huit types pris en
+   charge. Les dépendances directes inutilisées `hickory-client` et `hickory-server` sont
+   supprimées.
 
 ## Ébauche d’architecture Rust
 

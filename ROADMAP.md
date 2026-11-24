@@ -36,12 +36,15 @@ Ordre d’implémentation proposé ; les identifiants renvoient à
 5. **Publication BIND** — `SPEC-BIND-01..08` implémentées sur
    `feat/bind-publisher` : zones dynamiques, réservation du nom au premier
    tenant, activation/suppression bornées et coalescence des publications.
-6. **Listing et observabilité** — `SPEC-LIST-01` et `04` terminées sur
-   `feat/list-zone-pagination` : listing sans lecture des fichiers de zone,
-   pagination par offset, limite par page. `SPEC-LIST-02..03` restent
-   conditionnelles à un besoin d’index ; `SPEC-OBS-01`, `03..05` restent à faire.
-7. **Vérification** — `SPEC-T-*`, `SPEC-AC-*` : tests unitaires et de
-   concurrence, puis tests d’intégration contre un BIND réel.
+6. **Listing et observabilité** — `SPEC-LIST-01` et `04` terminées ;
+   `SPEC-OBS-01..05` terminées sur `feat/runtime-observability` (délais séparés,
+   timings Server-Timing, codes d’erreur stables, logs corrélés). `SPEC-LIST-02..03`
+   restent conditionnelles à un besoin d’index établi par mesure.
+7. **Vérification** — déjà couverts : RR rendus, écritures concurrentes
+   sérialisées, panne `rndc` réessayable et échec de validation atomique.
+   Restent `SPEC-AC-08`, qui exige une vérification contre un BIND réel, absent
+   de l’environnement local. `SPEC-LIST-02..03` ne seront activées que si les
+   timings montrent que l’index devient utile.
 
 Branche suggérée pour le chantier complet : `feat/runtime-hardening`. Pour des
 changements plus petits et relisibles, séparer en `feat/rr-validation`,

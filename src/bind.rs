@@ -110,8 +110,12 @@ impl RndcClient {
         zone_file: &str,
         previously_active: bool,
     ) -> Result<(), RndcError> {
-        if previously_active && self.reload_zone(zone_name).is_ok() {
-            return Ok(());
+        if previously_active {
+            match self.reload_zone(zone_name) {
+                Ok(()) => return Ok(()),
+                Err(RndcError::CommandFailed(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
         self.add_zone(zone_name, zone_file)
     }

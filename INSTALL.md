@@ -29,6 +29,7 @@ DNS sont globaux : le premier tenant qui crée une zone en devient propriétaire
 | RNDC_BIN | rndc | Chemin ou nom de l’exécutable `rndc` |
 | RNDC_CONF | vide | Fichier `rndc.conf` optionnel; monter en lecture seule avec mode 0600 |
 | RNDC_TIMEOUT_SECS | 5 | Délai maximal d’un appel `rndc` (1 à 60 secondes) |
+| CHECKZONE_TIMEOUT_SECS | 5 | Délai maximal de `named-checkzone` (1 à 60 secondes) |
 | JWT_SECRET | vide | Secret HS256 historique, minimum 32 octets |
 | JWT_ED25519_PUBLIC_KEY | vide | Clé publique Ed25519 BFF en base64url (32 octets) ; prioritaire sur JWT_SECRET |
 | BFF_API_AUDIENCE | squilladns | Audience attendue dans le JWT signé par le BFF |
@@ -44,6 +45,13 @@ Le répertoire `.bind-owners` sous `ZONES_DIR` conserve les propriétaires des
 noms entre redémarrages. Ne le supprimez pas séparément des zones. Un échec
 `rndc` laisse la zone persistée mais inactive ; renvoyez PUT ou POST `/sync`
 pour réessayer.
+
+Les réponses PUT/SYNC exposent `activation_error` lorsque BIND n’a pas confirmé
+la publication, avec un code stable tel que `rndc_timeout` ou
+`publication_capacity_exhausted`. `Server-Timing` détaille la validation,
+l’attente du verrou, le filesystem, `named-checkzone`, la file de publication,
+`rndc` et la taille/count du payload. Les logs d’accès incluent le
+`X-Request-ID`; les en-têtes Server-Timing sont exposés en CORS.
 
 ## Docker Compose
 
