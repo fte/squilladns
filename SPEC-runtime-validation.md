@@ -203,9 +203,10 @@ requises au déploiement.
 - **SPEC-AC-07 [x]** La saturation complète des quotas I/O laisse les routes légères
   (`/health`) disponibles ; les workers bloquants restent bornés par la configuration.
   et ne dépasse pas les limites de concurrence configurées.
-- **SPEC-AC-08** Les créations et suppressions sont vérifiées contre un BIND réel : nouvelle
+- **SPEC-AC-08 [x]** Les créations et suppressions sont vérifiées contre un BIND réel : nouvelle
   zone publiée, zone modifiée avec le nouveau contenu, zone supprimée et plus
-  servie, redémarrage de BIND avec état persistant.
+  servie, redémarrage de BIND avec état persistant. Vérifié avec
+  `make test-bind-e2e RUNTIME=container` sur Debian Trixie/BIND 9.
 - **SPEC-AC-09 [x]** Les opérations d’un tenant ne peuvent ni lister, modifier, supprimer ou
   publier les zones d’un autre tenant, même avec des noms et payloads malformés.
 

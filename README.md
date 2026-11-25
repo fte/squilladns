@@ -52,12 +52,12 @@ pour recharger une zone existante.
 
 ~~~sh
 export API_TOKEN="$(openssl rand -hex 32)"
-docker compose up --build -d
+make up
 curl -fsS http://127.0.0.1:8085/health
 ~~~
 
 Si API_TOKEN est omis, l’API en génère un, le journalise au démarrage et le
-conserve dans .state/tokens. Voir [INSTALL.md](INSTALL.md) pour les volumes,
+conserve dans `var/lib/squilladns/state/tokens`. Voir [INSTALL.md](INSTALL.md) pour les volumes,
 variables d’environnement et le déploiement.
 
 ## Implémentation
