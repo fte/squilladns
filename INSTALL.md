@@ -18,8 +18,8 @@ DNS sont globaux : le premier tenant qui crée une zone en devient propriétaire
 |---|---|---|
 | API_ADDR | 0.0.0.0:8085 | Adresse d’écoute |
 | API_TOKEN | vide | Token bootstrap ; vide = génération au démarrage |
-| API_TOKEN_PATH | .state/tokens | Stockage local des tokens, permissions 0600 |
-| ZONES_DIR | zones/example.invalid | Racine des fichiers de zones |
+| API_TOKEN_PATH | /var/lib/squilladns/state/tokens dans l’image | Stockage des tokens, permissions 0600 |
+| ZONES_DIR | /var/lib/squilladns/zones dans l’image | Racine des fichiers de zones |
 | MAX_REQUEST_BODY_BYTES | 1048576 | Taille maximale du corps HTTP accepté (1 Mio) |
 | MAX_RECORDS_PER_ZONE | 10000 | Nombre maximal de RR dans un payload de zone |
 | MAX_RECORD_NAME_BYTES | 253 | Longueur maximale du nom propriétaire d’un RR, en octets |
@@ -62,8 +62,15 @@ curl -fsS http://127.0.0.1:8085/health
 docker compose logs
 ~~~
 
-Compose persiste zones et tokens via ./zones et ./.state. Omettre API_TOKEN
-est possible : le fichier d’état conserve le token généré entre les redémarrages.
+Compose et `make up` persistent zones et tokens sous
+`./var/lib/squilladns/{zones,state}` par défaut. Sur le VPS, définissez
+`DATA_DIR=/var/lib/squilladns` pour conserver les données dans le chemin système
+usuel. Créez les deux répertoires avec des droits adaptés à l’UID/GID utilisés
+par le conteneur. Si BIND tourne sur l’hôte, il doit aussi accéder au répertoire
+des zones ; configurez un groupe partagé. Pour `rndc`, placez éventuellement le
+fichier de configuration dans `state/rndc.conf` et réglez
+`RNDC_CONF=/var/lib/squilladns/state/rndc.conf`. Omettre API_TOKEN est possible :
+le fichier d’état conserve le token généré entre les redémarrages.
 
 Opérations usuelles :
 
@@ -77,7 +84,7 @@ docker compose down
 
 ~~~sh
 export API_TOKEN="$(openssl rand -hex 32)"
-export ZONES_DIR=./zones/example.invalid
+export ZONES_DIR=./var/lib/squilladns/zones
 cargo run --release
 ~~~
 
@@ -87,6 +94,29 @@ Le mode sandbox est réservé au développement local :
 SANDBOX_USER=alice cargo run
 ~~~
 
+### Développement local avec BIND 9
+
+`make dev-up` démarre l’API et BIND 9 dans le même conteneur Debian Trixie.
+Les chemins sont ceux de l’installation de production : zones et tokens sous
+`/var/lib/squilladns`, configuration BIND sous `/etc/bind` et état dynamique
+BIND sous `/var/cache/bind`. Les données sont conservées côté hôte dans
+`DATA_DIR` (par défaut `./var/lib/squilladns`).
+
+~~~sh
+make dev-up
+make shell
+# Dans le shell :
+rndc -c /etc/bind/squilladns-rndc.conf status
+dig @127.0.0.1 example.test A +norecurse
+# Depuis l’hôte, DNS est exposé sur 127.0.0.1:1053 :
+dig @127.0.0.1 -p 1053 example.test A +norecurse
+~~~
+
+L’interface cliente locale peut appeler l’API sur `http://localhost:8085`.
+`make dev-logs`, `make dev-ps` et `make dev-down` pilotent ce conteneur. Le
+secret RNDC de cette image est réservé au développement ; l’image production
+ne contient pas le serveur `named`.
+
 ## Authentification
 
 Le flux SSO et les claims JWT sont spécifiés dans [AUTH.md](AUTH.md).
@@ -95,6 +125,32 @@ Une authentification absente ouvre le scope public ; un credential invalide
 renvoie 401.
 
 ## Stockage et migration
+
+La mise à jour depuis la configuration Compose précédente change les chemins
+hôte : les zones étaient dans `./zones/example.invalid` et les tokens dans
+`./.state`; les chemins actuels par défaut sont
+`./var/lib/squilladns/{zones,state}`. Arrêtez l’ancienne instance et faites une
+sauvegarde avant la migration. Copiez les données puis alignez leur propriétaire
+sur l’UID/GID que Make transmet au conteneur :
+
+~~~sh
+mkdir -p var/lib/squilladns/zones var/lib/squilladns/state
+[ ! -d zones/example.invalid ] || cp -a zones/example.invalid/. var/lib/squilladns/zones/
+[ ! -d .state ] || cp -a .state/. var/lib/squilladns/state/
+sudo chown -R "$(id -u):$(id -g)" var/lib/squilladns
+~~~
+
+Cela conserve notamment `.bind-owners` et le token bootstrap. Pour `docker
+compose up` lancé directement, sans Make, le propriétaire des bind mounts doit
+être `10001:10001` ou correspondre aux variables `SQUILLADNS_UID` et
+`SQUILLADNS_GID`. Pour l’utilisateur par défaut de l’image :
+
+~~~sh
+sudo chown -R 10001:10001 var/lib/squilladns
+~~~
+
+Ne changez pas l’UID du conteneur sans ajuster aussi les permissions des
+répertoires montés.
 
 Les zones sont écrites sous ZONES_DIR/public ou ZONES_DIR/tenants/<id-interne>.
 L’identifiant interne n’est pas exposé par l’API. Les anciens répertoires de
@@ -108,6 +164,20 @@ Le fichier API_TOKEN_PATH accepte les anciens formats et les migre au chargement
 - Santé : GET http://127.0.0.1:8085/health
 - Swagger : http://127.0.0.1:8085/docs
 - Cibles Makefile : voir make help ; certaines opérations nécessitent Docker.
+
+Le test E2E opt-in `SPEC-AC-08` démarre une instance BIND isolée, vérifie la
+création, la mise à jour, la persistance après redémarrage et la suppression
+d’une zone via l’API. Il nécessite `named` et `rndc` disponibles dans le
+`PATH` ; `BIND_NAMED_BIN` et `BIND_RNDC_BIN` permettent d’indiquer leurs chemins.
+Lancer avec :
+
+~~~sh
+cargo test --test bind_e2e -- --ignored --nocapture
+~~~
+
+Avec le moteur de conteneurs détecté par Makefile (Apple Container prioritaire,
+Docker Compose sinon), lancer `make test-bind-e2e`. La cible construit une image
+de test séparée basée sur Debian Trixie avec BIND 9.
 
 En production, limite l’accès réseau à l’API, utilise un secret manager et
 monte des volumes persistants. Restreins CORS aux origines réellement utilisées.

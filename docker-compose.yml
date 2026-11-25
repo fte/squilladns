@@ -5,12 +5,17 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      target: runtime
     container_name: squilladns
+    # make up injecte l’UID/GID du propriétaire des bind mounts. En Compose
+    # direct, reprendre l’utilisateur non-root déclaré par l’image.
+    user: "${SQUILLADNS_UID:-10001}:${SQUILLADNS_GID:-10001}"
     ports:
       - "8085:8085"
     environment:
       - API_TOKEN=${API_TOKEN:-}
-      - API_TOKEN_PATH=/app/state/tokens
+      - ZONES_DIR=/var/lib/squilladns/zones
+      - API_TOKEN_PATH=/var/lib/squilladns/state/tokens
       - MAX_REQUEST_BODY_BYTES=${MAX_REQUEST_BODY_BYTES:-1048576}
       - MAX_RECORDS_PER_ZONE=${MAX_RECORDS_PER_ZONE:-10000}
       - MAX_RECORD_NAME_BYTES=${MAX_RECORD_NAME_BYTES:-253}
@@ -23,11 +28,14 @@ services:
       - CHECKZONE_TIMEOUT_SECS=${CHECKZONE_TIMEOUT_SECS:-5}
       - RUST_LOG=${RUST_LOG:-info}
       - JWT_SECRET=${JWT_SECRET:-}
+      - JWT_ED25519_PUBLIC_KEY=${JWT_ED25519_PUBLIC_KEY:-}
+      - BFF_API_AUDIENCE=${BFF_API_AUDIENCE:-squilladns}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-*}
       - SANDBOX_USER=${SANDBOX_USER:-}
     volumes:
       # Persister les zones localement si besoin
-      - ./zones:/app/zones
-      - ./.state:/app/state
+      - ${SQUILLADNS_DATA_DIR:-./var/lib/squilladns}/zones:/var/lib/squilladns/zones
+      - ${SQUILLADNS_DATA_DIR:-./var/lib/squilladns}/state:/var/lib/squilladns/state
     restart: unless-stopped
     networks:
       - dns-net

@@ -70,7 +70,9 @@ impl RndcClient {
         let executable = std::env::var_os("RNDC_BIN")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("rndc"));
-        let config_file = std::env::var_os("RNDC_CONF").map(PathBuf::from);
+        let config_file = std::env::var_os("RNDC_CONF")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
         let timeout_secs = match std::env::var("RNDC_TIMEOUT_SECS") {
             Ok(value) => value
                 .parse::<u64>()

@@ -41,10 +41,10 @@ Ordre d’implémentation proposé ; les identifiants renvoient à
    timings Server-Timing, codes d’erreur stables, logs corrélés). `SPEC-LIST-02..03`
    restent conditionnelles à un besoin d’index établi par mesure.
 7. **Vérification** — déjà couverts : RR rendus, écritures concurrentes
-   sérialisées, panne `rndc` réessayable et échec de validation atomique.
-   Restent `SPEC-AC-08`, qui exige une vérification contre un BIND réel, absent
-   de l’environnement local. `SPEC-LIST-02..03` ne seront activées que si les
-   timings montrent que l’index devient utile.
+   sérialisées, panne `rndc` réessayable, échec de validation atomique et
+   `SPEC-AC-08` vérifiée par le test E2E contre BIND 9 dans Apple Container.
+   `SPEC-LIST-02..03` ne seront activées que si les timings montrent que
+   l’index devient utile.
 
 Branche suggérée pour le chantier complet : `feat/runtime-hardening`. Pour des
 changements plus petits et relisibles, séparer en `feat/rr-validation`,

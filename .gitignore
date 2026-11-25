@@ -1,6 +1,7 @@
 /target
 .api-token
 /.state
+/var/lib/squilladns/
 *.log
 .DS_Store
 .env
