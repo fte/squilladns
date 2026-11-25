@@ -8,6 +8,7 @@ use squilladns::request_limits::{
     body_limit, run_limited, run_limited_by, BlockingWorkError, RequestLimits,
 };
 use std::sync::{mpsc, Arc};
+use std::time::Duration;
 use tokio::sync::Semaphore;
 use tower::ServiceExt;
 
@@ -129,5 +130,14 @@ async fn blocking_worker_keeps_its_permit_after_request_cancellation() {
     );
     release_tx.send(()).unwrap();
     finished_rx.await.unwrap();
+
+    // `finished` is sent inside the blocking closure, immediately before it
+    // returns. Wait for the worker to drop its permit before asserting that
+    // new work can enter; otherwise the test races the closure epilogue.
+    let permit = tokio::time::timeout(Duration::from_secs(1), Arc::clone(&slots).acquire_owned())
+        .await
+        .expect("le worker doit rendre le permis après sa fin")
+        .unwrap();
+    drop(permit);
     assert_eq!(run_limited(slots, || ()).await, Ok(()));
 }

@@ -38,21 +38,39 @@ async fn run_bind_dynamic_zone_lifecycle() -> Result<(), Box<dyn std::error::Err
     let zones_dir = work_dir.0.join("zones");
     fs::create_dir_all(&zones_dir)?;
 
-    let dns_port = free_udp_port()?;
-    let (rndc_port, api_port) = free_tcp_ports()?;
+    let mut ports = ReservedPorts::new()?;
     let named_config = work_dir.0.join("named.conf");
     let rndc_config = work_dir.0.join("rndc.conf");
-    write_bind_configs(work_path, &named_config, &rndc_config, dns_port, rndc_port)?;
+    write_bind_configs(
+        work_path,
+        &named_config,
+        &rndc_config,
+        ports.dns_port,
+        ports.rndc_port,
+    )?;
 
     let named_bin = executable("BIND_NAMED_BIN", "named");
     let rndc_bin = executable("BIND_RNDC_BIN", "rndc");
-    let mut named = ChildGuard(start_named(&named_bin, &named_config, dns_port, work_path)?);
-    wait_for_named(&mut named.0, dns_port, &rndc_bin, &rndc_config).await?;
+    let rndc = RndcClient::new(
+        rndc_bin.clone(),
+        Some(rndc_config.clone()),
+        Duration::from_secs(1),
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    ports.release_for_named();
+    let mut named = ChildGuard(start_named(
+        &named_bin,
+        &named_config,
+        ports.dns_port,
+        work_path,
+    )?);
+    wait_for_named(&mut named.0, ports.dns_port, &rndc).await?;
 
     let api_bin = env!("CARGO_BIN_EXE_squilladns");
+    ports.release_for_api();
     let api = start_api(
         api_bin,
-        api_port,
+        ports.api_port,
         &zones_dir,
         &rndc_bin,
         &rndc_config,
@@ -60,7 +78,7 @@ async fn run_bind_dynamic_zone_lifecycle() -> Result<(), Box<dyn std::error::Err
     )?;
     let mut api = ChildGuard(api);
     let client = Client::new();
-    let base_url = format!("http://127.0.0.1:{}", api_port);
+    let base_url = format!("http://127.0.0.1:{}", ports.api_port);
     wait_for_api(&client, &base_url, &mut api.0).await?;
 
     let create = client
@@ -70,7 +88,7 @@ async fn run_bind_dynamic_zone_lifecycle() -> Result<(), Box<dyn std::error::Err
         .await?;
     assert_eq!(create.status(), StatusCode::CREATED);
     assert!(response_active(create.json::<Value>().await?));
-    wait_for_a_record(dns_port, Some(FIRST_IP)).await?;
+    wait_for_a_record(ports.dns_port, Some(FIRST_IP)).await?;
 
     let update = client
         .put(format!("{}/zones/{}", base_url, TEST_ZONE))
@@ -79,22 +97,43 @@ async fn run_bind_dynamic_zone_lifecycle() -> Result<(), Box<dyn std::error::Err
         .await?;
     assert_eq!(update.status(), StatusCode::OK);
     assert!(response_active(update.json::<Value>().await?));
-    wait_for_a_record(dns_port, Some(SECOND_IP)).await?;
+    wait_for_a_record(ports.dns_port, Some(SECOND_IP)).await?;
 
-    named.stop()?;
-    named = ChildGuard(start_named(&named_bin, &named_config, dns_port, work_path)?);
-    wait_for_named(&mut named.0, dns_port, &rndc_bin, &rndc_config).await?;
-    wait_for_a_record(dns_port, Some(SECOND_IP)).await?;
+    stop_named_gracefully(&mut named.0, &rndc).await?;
+    named = ChildGuard(start_named(
+        &named_bin,
+        &named_config,
+        ports.dns_port,
+        work_path,
+    )?);
+    wait_for_named(&mut named.0, ports.dns_port, &rndc).await?;
+    assert!(rndc.run(&["zonestatus", TEST_ZONE]).is_ok());
+    wait_for_a_record(ports.dns_port, Some(SECOND_IP)).await?;
 
     let delete = client
         .delete(format!("{}/zones/{}", base_url, TEST_ZONE))
         .send()
         .await?;
     assert_eq!(delete.status(), StatusCode::OK);
-    wait_for_a_record(dns_port, None).await?;
+    let deletion = delete.json::<Value>().await?;
+    assert_eq!(
+        deletion.get("persisted").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(deletion.get("active").and_then(Value::as_bool), Some(false));
+    wait_for_a_record(ports.dns_port, None).await?;
+    assert!(rndc.run(&["zonestatus", TEST_ZONE]).is_err());
+    let zone_file = zones_dir
+        .join("public")
+        .join(TEST_ZONE)
+        .join(format!("{}.zone", TEST_ZONE));
+    assert!(
+        !zone_file.exists(),
+        "zone file should be removed after DELETE"
+    );
 
     api.stop()?;
-    named.stop()?;
+    stop_named_gracefully(&mut named.0, &rndc).await?;
     Ok(())
 }
 
@@ -191,17 +230,40 @@ fn named_conf_string(path: &Path) -> io::Result<String> {
     Ok(value.to_string())
 }
 
-fn free_tcp_ports() -> io::Result<(u16, u16)> {
-    let rndc_listener = TcpListener::bind(("127.0.0.1", 0))?;
-    let api_listener = TcpListener::bind(("127.0.0.1", 0))?;
-    Ok((
-        rndc_listener.local_addr()?.port(),
-        api_listener.local_addr()?.port(),
-    ))
+struct ReservedPorts {
+    dns_port: u16,
+    rndc_port: u16,
+    api_port: u16,
+    dns_socket: Option<UdpSocket>,
+    rndc_listener: Option<TcpListener>,
+    api_listener: Option<TcpListener>,
 }
 
-fn free_udp_port() -> io::Result<u16> {
-    Ok(UdpSocket::bind(("127.0.0.1", 0))?.local_addr()?.port())
+impl ReservedPorts {
+    fn new() -> io::Result<Self> {
+        // Keep all three sockets bound until each server is ready to take
+        // ownership of its port. This also guarantees the TCP ports differ.
+        let dns_socket = UdpSocket::bind(("127.0.0.1", 0))?;
+        let rndc_listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let api_listener = TcpListener::bind(("127.0.0.1", 0))?;
+        Ok(Self {
+            dns_port: dns_socket.local_addr()?.port(),
+            rndc_port: rndc_listener.local_addr()?.port(),
+            api_port: api_listener.local_addr()?.port(),
+            dns_socket: Some(dns_socket),
+            rndc_listener: Some(rndc_listener),
+            api_listener: Some(api_listener),
+        })
+    }
+
+    fn release_for_named(&mut self) {
+        self.dns_socket.take();
+        self.rndc_listener.take();
+    }
+
+    fn release_for_api(&mut self) {
+        self.api_listener.take();
+    }
 }
 
 fn start_named(binary: &Path, config: &Path, dns_port: u16, work_dir: &Path) -> io::Result<Child> {
@@ -274,19 +336,8 @@ fn stop_child(child: &mut Child) -> io::Result<()> {
     }
 }
 
-async fn wait_for_named(
-    child: &mut Child,
-    dns_port: u16,
-    rndc_bin: &Path,
-    rndc_config: &Path,
-) -> io::Result<()> {
+async fn wait_for_named(child: &mut Child, dns_port: u16, rndc: &RndcClient) -> io::Result<()> {
     let address = SocketAddr::from(([127, 0, 0, 1], dns_port));
-    let rndc = RndcClient::new(
-        rndc_bin.to_path_buf(),
-        Some(rndc_config.to_path_buf()),
-        Duration::from_secs(1),
-    )
-    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if child.try_wait()?.is_some() {
@@ -308,6 +359,28 @@ async fn wait_for_named(
             ));
         }
         sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn stop_named_gracefully(child: &mut Child, rndc: &RndcClient) -> io::Result<()> {
+    rndc.run(&["stop"]).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("rndc stop failed: {:?}", error),
+        )
+    })?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "named did not exit after rndc stop",
+            ));
+        }
+        sleep(Duration::from_millis(25)).await;
     }
 }
 
