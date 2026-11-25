@@ -7,7 +7,9 @@ services:
       dockerfile: Dockerfile
       target: runtime
     container_name: squilladns
-    user: "${SQUILLADNS_UID:-1000}:${SQUILLADNS_GID:-1000}"
+    # make up injecte l’UID/GID du propriétaire des bind mounts. En Compose
+    # direct, reprendre l’utilisateur non-root déclaré par l’image.
+    user: "${SQUILLADNS_UID:-10001}:${SQUILLADNS_GID:-10001}"
     ports:
       - "8085:8085"
     environment:

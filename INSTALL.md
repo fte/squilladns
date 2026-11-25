@@ -126,6 +126,32 @@ renvoie 401.
 
 ## Stockage et migration
 
+La mise à jour depuis la configuration Compose précédente change les chemins
+hôte : les zones étaient dans `./zones/example.invalid` et les tokens dans
+`./.state`; les chemins actuels par défaut sont
+`./var/lib/squilladns/{zones,state}`. Arrêtez l’ancienne instance et faites une
+sauvegarde avant la migration. Copiez les données puis alignez leur propriétaire
+sur l’UID/GID que Make transmet au conteneur :
+
+~~~sh
+mkdir -p var/lib/squilladns/zones var/lib/squilladns/state
+[ ! -d zones/example.invalid ] || cp -a zones/example.invalid/. var/lib/squilladns/zones/
+[ ! -d .state ] || cp -a .state/. var/lib/squilladns/state/
+sudo chown -R "$(id -u):$(id -g)" var/lib/squilladns
+~~~
+
+Cela conserve notamment `.bind-owners` et le token bootstrap. Pour `docker
+compose up` lancé directement, sans Make, le propriétaire des bind mounts doit
+être `10001:10001` ou correspondre aux variables `SQUILLADNS_UID` et
+`SQUILLADNS_GID`. Pour l’utilisateur par défaut de l’image :
+
+~~~sh
+sudo chown -R 10001:10001 var/lib/squilladns
+~~~
+
+Ne changez pas l’UID du conteneur sans ajuster aussi les permissions des
+répertoires montés.
+
 Les zones sont écrites sous ZONES_DIR/public ou ZONES_DIR/tenants/<id-interne>.
 L’identifiant interne n’est pas exposé par l’API. Les anciens répertoires de
 tenant hashés sont déplacés au premier appel JWT. Les répertoires user-* de

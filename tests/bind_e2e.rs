@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
+use squilladns::bind::RndcClient;
 use tokio::time::sleep;
 
 const TEST_ZONE: &str = "squilladns-e2e.test";
@@ -38,8 +39,7 @@ async fn run_bind_dynamic_zone_lifecycle() -> Result<(), Box<dyn std::error::Err
     fs::create_dir_all(&zones_dir)?;
 
     let dns_port = free_udp_port()?;
-    let rndc_port = free_tcp_port()?;
-    let api_port = free_tcp_port()?;
+    let (rndc_port, api_port) = free_tcp_ports()?;
     let named_config = work_dir.0.join("named.conf");
     let rndc_config = work_dir.0.join("rndc.conf");
     write_bind_configs(work_path, &named_config, &rndc_config, dns_port, rndc_port)?;
@@ -47,7 +47,7 @@ async fn run_bind_dynamic_zone_lifecycle() -> Result<(), Box<dyn std::error::Err
     let named_bin = executable("BIND_NAMED_BIN", "named");
     let rndc_bin = executable("BIND_RNDC_BIN", "rndc");
     let mut named = ChildGuard(start_named(&named_bin, &named_config, dns_port, work_path)?);
-    wait_for_named(&mut named.0, dns_port).await?;
+    wait_for_named(&mut named.0, dns_port, &rndc_bin, &rndc_config).await?;
 
     let api_bin = env!("CARGO_BIN_EXE_squilladns");
     let api = start_api(
@@ -83,7 +83,7 @@ async fn run_bind_dynamic_zone_lifecycle() -> Result<(), Box<dyn std::error::Err
 
     named.stop()?;
     named = ChildGuard(start_named(&named_bin, &named_config, dns_port, work_path)?);
-    wait_for_named(&mut named.0, dns_port).await?;
+    wait_for_named(&mut named.0, dns_port, &rndc_bin, &rndc_config).await?;
     wait_for_a_record(dns_port, Some(SECOND_IP)).await?;
 
     let delete = client
@@ -191,8 +191,13 @@ fn named_conf_string(path: &Path) -> io::Result<String> {
     Ok(value.to_string())
 }
 
-fn free_tcp_port() -> io::Result<u16> {
-    Ok(TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
+fn free_tcp_ports() -> io::Result<(u16, u16)> {
+    let rndc_listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let api_listener = TcpListener::bind(("127.0.0.1", 0))?;
+    Ok((
+        rndc_listener.local_addr()?.port(),
+        api_listener.local_addr()?.port(),
+    ))
 }
 
 fn free_udp_port() -> io::Result<u16> {
@@ -269,8 +274,19 @@ fn stop_child(child: &mut Child) -> io::Result<()> {
     }
 }
 
-async fn wait_for_named(child: &mut Child, dns_port: u16) -> io::Result<()> {
+async fn wait_for_named(
+    child: &mut Child,
+    dns_port: u16,
+    rndc_bin: &Path,
+    rndc_config: &Path,
+) -> io::Result<()> {
     let address = SocketAddr::from(([127, 0, 0, 1], dns_port));
+    let rndc = RndcClient::new(
+        rndc_bin.to_path_buf(),
+        Some(rndc_config.to_path_buf()),
+        Duration::from_secs(1),
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if child.try_wait()?.is_some() {
@@ -279,7 +295,10 @@ async fn wait_for_named(child: &mut Child, dns_port: u16) -> io::Result<()> {
                 "named exited before opening its DNS listener",
             ));
         }
-        if query_a(address, TEST_OWNER).is_ok() {
+        // Confirm the control channel belongs to the named process this test
+        // started, rather than treating any response on a recycled UDP port
+        // as proof that BIND is ready.
+        if rndc.run(&["status"]).is_ok() && query_a(address, TEST_OWNER).is_ok() {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -335,7 +354,11 @@ async fn wait_for_a_record(
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(actual) = query_a(address, TEST_OWNER) {
-            if actual == expected {
+            let matches_expected = match expected {
+                Some(expected) => actual.rcode == 0 && actual.address == Some(expected),
+                None => actual.address.is_none() && matches!(actual.rcode, 3 | 5),
+            };
+            if matches_expected {
                 return Ok(());
             }
         }
@@ -364,7 +387,12 @@ fn dns_query(name: &str) -> Vec<u8> {
     packet
 }
 
-fn query_a(address: SocketAddr, name: &str) -> io::Result<Option<Ipv4Addr>> {
+struct DnsAnswer {
+    rcode: u8,
+    address: Option<Ipv4Addr>,
+}
+
+fn query_a(address: SocketAddr, name: &str) -> io::Result<DnsAnswer> {
     let socket = UdpSocket::bind(("127.0.0.1", 0))?;
     socket.set_read_timeout(Some(Duration::from_millis(700)))?;
     socket.send_to(&dns_query(name), address)?;
@@ -375,6 +403,13 @@ fn query_a(address: SocketAddr, name: &str) -> io::Result<Option<Ipv4Addr>> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid DNS response",
+        ));
+    }
+    let rcode = response[3] & 0x0f;
+    if !matches!(rcode, 0 | 3 | 5) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unexpected DNS response code {}", rcode),
         ));
     }
     let question_count = u16::from_be_bytes([response[4], response[5]]) as usize;
@@ -402,16 +437,22 @@ fn query_a(address: SocketAddr, name: &str) -> io::Result<Option<Ipv4Addr>> {
             .filter(|end| *end <= response.len())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "truncated DNS RDATA"))?;
         if record_type == 1 && class == 1 && data_len == 4 {
-            return Ok(Some(Ipv4Addr::new(
-                response[cursor],
-                response[cursor + 1],
-                response[cursor + 2],
-                response[cursor + 3],
-            )));
+            return Ok(DnsAnswer {
+                rcode,
+                address: Some(Ipv4Addr::new(
+                    response[cursor],
+                    response[cursor + 1],
+                    response[cursor + 2],
+                    response[cursor + 3],
+                )),
+            });
         }
         cursor = data_end;
     }
-    Ok(None)
+    Ok(DnsAnswer {
+        rcode,
+        address: None,
+    })
 }
 
 fn skip_dns_name(packet: &[u8], cursor: &mut usize) -> io::Result<()> {
