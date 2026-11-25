@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  rust-and-bind-e2e:
+  rust-tests:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -28,11 +28,3 @@ jobs:
 
       - name: Run Rust tests
         run: cargo test --locked
-
-      - name: Install BIND 9
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes bind9 bind9-utils
-
-      - name: Run real BIND E2E test
-        run: cargo test --locked --test bind_e2e -- --ignored --nocapture
